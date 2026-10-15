@@ -47,6 +47,30 @@ function Find-FfmpegDir {
     return ''
 }
 
+function PSQuote([string]$s) { return "'" + $s.Replace("'", "''") + "'" }
+
+# 把“真正删除”交给一个独立后台进程，等调用方窗口退出之后再执行。
+# 原因：双击 一键卸载.bat 时 cmd 会逐行读取那个 .bat；若此刻就删掉 script\，
+# cmd 会因为读不到脚本文件而报“找不到路径”并以非零码退出。
+function Start-DeferredRemove([string]$dir, [bool]$toRecycle) {
+    $q = PSQuote $dir
+    $body = "Start-Sleep -Seconds 3`r`n"
+    if ($toRecycle) {
+        $body += "try {`r`n  Add-Type -AssemblyName Microsoft.VisualBasic`r`n"
+        $body += "  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($q,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)`r`n"
+        $body += "} catch {`r`n  Remove-Item -LiteralPath $q -Recurse -Force -ErrorAction SilentlyContinue`r`n}`r`n"
+    } else {
+        $body += "Remove-Item -LiteralPath $q -Recurse -Force -ErrorAction SilentlyContinue`r`n"
+    }
+    $body += "Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue`r`n"
+
+    $tmp = Join-Path $env:TEMP ('ffeu_uninstall_' + [guid]::NewGuid().ToString('N') + '.ps1')
+    [System.IO.File]::WriteAllText($tmp, $body, (New-Object System.Text.UTF8Encoding($true)))
+    # 用“整条命令行字符串”传参，避免路径含空格时被 Start-Process 拆散
+    $argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $tmp + '"'
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $argLine -WindowStyle Hidden | Out-Null
+}
+
 function ToRecycleBin([string]$path) {
     try {
         Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
@@ -64,6 +88,10 @@ Info '  ffmpeg-Easy-Use · 一键卸载'
 Info '  （只移除工具目录，ffmpeg 本体保留）'
 Info '============================================================'
 Info ''
+
+# 把本进程的工作目录移出“待删除目录”所在的位置：
+# Windows 不允许删除“当前工作目录”所在的目录，否则会因为“正在使用中”而失败。
+try { Set-Location -LiteralPath $env:SystemRoot } catch { }
 
 # ---------- 定位要移除的 script 目录 ----------
 $ScriptDir = ''
@@ -107,25 +135,53 @@ if (-not $Yes) {
 }
 
 # ---------- 执行移除 ----------
-$done = $false
-if ($Hard) {
-    Remove-Item -LiteralPath $ScriptDir -Recurse -Force
-    $done = $true
-} else {
-    $done = ToRecycleBin $ScriptDir
-    if (-not $done) {
-        $bak = $ScriptDir + '.removed-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-        Move-Item -LiteralPath $ScriptDir -Destination $bak -Force
-        Warn "当前环境不支持送回收站，已改名为: $bak（确认无用后可手动删除）"
-        $done = $true
-    }
+# 本脚本是不是就位于“待删目录”里面？是的话（双击 一键卸载.bat 的常规情形）
+# 不能当场删除，否则 cmd 读不到它正在执行的 .bat 尾部，会报错并返回非零码。
+$selfInside = $false
+if ($PSScriptRoot) {
+    try {
+        $selfInside = $PSScriptRoot.StartsWith(($ScriptDir.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)
+    } catch { $selfInside = $false }
 }
 
-if (-not $done) { Die "移除失败: $ScriptDir" }
+if ($selfInside) {
+    Start-DeferredRemove $ScriptDir (-not $Hard)
+    Info ''
+    Good '=========================== 卸载完成 ==========================='
+    Info "工具目录将在本窗口关闭后自动移除: $ScriptDir"
+} else {
+    $done = $false
+    $err = ''
+    if ($Hard) {
+        try { Remove-Item -LiteralPath $ScriptDir -Recurse -Force; $done = $true }
+        catch { $err = $_.Exception.Message }
+    } else {
+        if (ToRecycleBin $ScriptDir) {
+            $done = $true
+        } else {
+            $bak = $ScriptDir + '.removed-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            try {
+                Move-Item -LiteralPath $ScriptDir -Destination $bak -Force
+                Warn "当前环境不支持送回收站，已改名为: $bak（确认无用后可手动删除）"
+                $done = $true
+            } catch { $err = $_.Exception.Message }
+        }
+    }
 
-Info ''
-Good '=========================== 卸载完成 ==========================='
-Info "已移除工具目录: $ScriptDir"
+    if (-not $done) {
+        Bad ''
+        Bad "[卸载失败] 无法移除目录: $ScriptDir"
+        Bad "原因: $err"
+        Warn '该目录可能正被占用（例如某个窗口的工作目录就在其中，或文件正被打开）。'
+        Warn '请关闭相关窗口/程序后重试，或手动删除该目录；ffmpeg 不受影响。'
+        exit 2
+    }
+
+    Info ''
+    Good '=========================== 卸载完成 ==========================='
+    Info "已移除工具目录: $ScriptDir"
+}
+
 if (Test-Path -LiteralPath $BinDir) {
     Good "ffmpeg 已保留（未删除）: $BinDir"
 } else {
