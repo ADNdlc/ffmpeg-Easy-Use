@@ -10,27 +10,50 @@
 
 ## 一键安装
 
-先下载或克隆本仓库，然后在仓库目录里双击其中一个入口：
+先下载或克隆本仓库，然后在仓库目录里**双击 `一键安装.bat`**（无需任何参数）。安装器会自动判断两种情况：
 
-| 入口 | 适用情况 | 做了什么 |
-|------|----------|----------|
-| `一键安装(已有ffmpeg).bat` | 电脑上已经有 ffmpeg | 把工具装到 ffmpeg 所在目录的**同级** `script\`，直接复用这个 ffmpeg |
-| `一键安装(自动下载ffmpeg).bat` | 没有 ffmpeg（或想要一份独立副本） | 先下载官方 **essentials** 版到 `<安装根>\bin`，再把工具装到 `<安装根>\script` |
+| 情况 | 装成什么样 |
+|------|------------|
+| 机器上**有** ffmpeg（`PATH` 或 `where.exe` 能找到） | 工具装到 ffmpeg 所在目录的**同级** `script\`；**不复制 ffmpeg、不新建 `bin\`**，而是在 `<安装根>\bin` 建一个**目录联接（junction）**指向你已有的 ffmpeg 目录 |
+| 机器上**没有** ffmpeg | 默认装到**当前盘** `<盘>:\Tool\FFmpeg`，在根下创建 `bin\`（自动下载 essentials 版）和 `script\`（工具本体）；**下载前会先问你一次** |
+
+> - 不想被问、直接下载：加 `-Mode download`
+> - 即使没有 ffmpeg 也**绝不下载**：加 `-NoDownload`（此时需自己把 `ffmpeg.exe` / `ffprobe.exe` 放进 `<安装根>\bin`）
 
 ### 安装到哪（根目录解析规则）
 
-1. **你在命令行里显式给了 `-Root`** → 就用它；
-2. **检测到 `ffmpeg.exe`**（`PATH` 或 `where.exe` 能找到）→ 取它所在目录：
-   - 若该层目录名是 `bin`，则 `<安装根>` 取它的**上一级** → 形成与本机一致的 `{bin, script}` 结构；
-   - 否则直接用它所在目录作为 `<安装根>`（不会去创建奇怪的盘根目录）；
-3. **都没有** → 默认装到**安装器所在盘**的 `<盘>:\Tool\FFmpeg`。
+1. 显式给了 `-Root <目录>` → 直接用它作为**安装根**（高级用法）；
+2. 显式给了 `-Target <目录>` → 装到 `<目录>\FFmpeg`（若该目录名本身就是 `FFmpeg`，就直接当安装根）；
+3. **检测到 `ffmpeg.exe`**（`PATH` 或 `where.exe` 能找到）→ 取它所在目录：
+   - 若该层目录名是 `bin`，则安装根取它的**上一级** → 形成 `{bin, script}` 结构；
+   - 否则直接用它所在目录作为安装根（不会去创建奇怪的盘根目录）；
+4. **都没检测到** → 默认装到**安装器所在盘**的 `<盘>:\Tool\FFmpeg`。
+
+### 装到指定目录（两种做法）
+
+**做法一（不改脚本）**：把目标目录**拖到 `一键安装.bat` 图标上**，即装到「该目录\FFmpeg\」：
+- 那里没有可用 ffmpeg → 创建 `FFmpeg\bin\`（下载）与 `FFmpeg\script\`（工具）；
+- 那里已有可用 ffmpeg → 只创建 `FFmpeg\script\`，`FFmpeg\bin` 用**联接**指向已有的 ffmpeg。
+
+等价的命令行方式：
+
+```powershell
+cd "<仓库目录>\install"
+powershell -ExecutionPolicy Bypass -File install.ps1 -Target D:\MyTools
+```
+
+**做法二（脚本更改方法）**：编辑 `install\install.ps1` 顶部这一行，之后双击安装就固定装到那里：
+
+```powershell
+$DefaultParentDir = ''      # 例：改成 'D:\MyTools'  ->  装到 D:\MyTools\FFmpeg\
+```
 
 安装后的结构（以 `D:\Tool\FFmpeg` 为例）：
 
 ```
 D:\Tool\FFmpeg\
-├─ bin\                 ← ffmpeg.exe / ffprobe.exe（已有的会复用，不会重复下载）
-│   └─ ...
+├─ bin\                 ← ffmpeg.exe / ffprobe.exe
+│   └─ ...                  （没 ffmpeg 时下载到这里；已有 ffmpeg 时这里是指向它的“联接”，不额外占空间）
 └─ script\              ← 本工具
     ├─ ffmpeg批量压缩.bat      ← 日常就拖这一个
     ├─ 打开命令行(高级).bat
@@ -46,14 +69,16 @@ D:\Tool\FFmpeg\
 - **目标位置有一个同名“文件”**：同样先改名备份。
 - **已有本工具**：执行**就地更新**，并**保留你 `config.json` 里的档位/画质等设置**（只更新 ffmpeg 与工作目录）。
 - **`<安装根>\bin` 已有 ffmpeg**：跳过下载，直接复用。
-- **下载失败/网络受限**：可改用“已有 ffmpeg”入口，或用 `-FfmpegZip` 指定一个本地 zip/URL。
+- **检测到的 ffmpeg 只有 `ffmpeg.exe` 没有 `ffprobe.exe`**：视为不可用，会按“没有 ffmpeg”处理（询问后下载）。
+- **建立 `bin` 联接失败**（少数环境/杀软拦截）：改为把配置里的 `ffmpeg_dir` 直接指向你已有目录，不复制文件。
+- **下载失败/网络受限**：可用 `-FfmpegZip <本地zip或URL>`，或手动把 `ffmpeg.exe` / `ffprobe.exe` 放进 `<安装根>\bin` 后重试。
 - 安装器**只新增/覆盖文件**，不删除任何用户数据；唯一的重命名只发生在冲突备份时。
 
 ### 想先看看会发生什么（预演）
 
 ```powershell
-cd "<安装根>\script\install"
-powershell -ExecutionPolicy Bypass -File install.ps1 -Mode download -DryRun
+cd "<仓库目录>\install"
+powershell -ExecutionPolicy Bypass -File install.ps1 -DryRun
 ```
 
 `-DryRun` 只打印将要使用的安装根/工具目录/ffmpeg 来源，**不改动任何文件**。
@@ -269,8 +294,7 @@ python review.py --work "<目标目录>"   ← 等价命令行入口；python re
 ffmpeg-Easy-Use\
 ├─ ffmpeg批量压缩.bat      ← 统一入口（拖入即用）
 ├─ 打开命令行(高级).bat
-├─ 一键安装(已有ffmpeg).bat
-├─ 一键安装(自动下载ffmpeg).bat
+├─ 一键安装.bat            ← 双击即装；拖入目录 = 装到「目录\FFmpeg\」
 ├─ 一键卸载.bat
 ├─ install\                ← 安装/卸载脚本（PowerShell）
 │   ├─ install.ps1

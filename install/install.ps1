@@ -2,29 +2,48 @@
 <#
   ffmpeg-Easy-Use —— 一键安装脚本（Windows PowerShell 5.1+）
 
-  用法:
-    powershell -ExecutionPolicy Bypass -File install.ps1 -Mode auto        # 复用已安装的 ffmpeg
-    powershell -ExecutionPolicy Bypass -File install.ps1 -Mode download    # 没有 ffmpeg 时自动下载(essentials 版)
+  用法（默认，无需任何参数）:
+    powershell -ExecutionPolicy Bypass -File install.ps1
+      先扫描机器上的 ffmpeg：扫到就装到它同级；没扫到就装到当前盘并询问是否自动下载
+
   可选参数:
-    -Root <目录>    显式指定安装根目录（根内创建 script\ ；ffmpeg 位于 <根>\bin 或直接位于根）
-    -Force          目标 script\ 已存在且不是本工具时，自动备份后继续（默认改为交互确认）
-    -FfmpegZip <x>  用本地 zip 文件或 http(s) URL 代替在线下载
+    -Target <目录>   指定“父目录”，在其中创建 FFmpeg\（内含 bin\ 与 script\）；
+                     若该目录本身已叫 FFmpeg，则直接采用它
+    -Root <目录>     直接指定安装根本身（高级用法；根内需能容纳 script\ 与 ffmpeg）
+    -Mode download   跳过询问，直接下载 essentials 版
+    -NoDownload      即使没扫到 ffmpeg 也绝不下载（只用 -FfmpegZip 或手动放置）
+    -FfmpegZip <x>   用本地 zip 文件或 http(s) URL 代替在线下载
+    -Force           所有交互询问一律确认（冲突自动备份；下载不再询问）
+    -DryRun          只预演，不修改任何文件
 
   安装根解析优先级:
     1) -Root 显式指定
-    2) 检测到 ffmpeg.exe -> 取它所在目录的上一级（若该层目录名是 bin，则作为 <根>\bin；<根>\script 与之同级）
-    3) 都没有 -> 安装器所在盘根下 <盘>:\Tool\FFmpeg
+    2) -Target 指定的父目录 + \FFmpeg
+    3) 扫到 ffmpeg.exe -> 它所在目录的上一级（该层名为 bin 时即 <根>\bin）
+    4) 都没扫到 -> <默认父目录>\FFmpeg（默认 = 安装器所在盘的 \Tool）
 
-  本脚本只“新增/覆盖”文件，不删除任何用户数据；唯一的重命名只发生在命名冲突备份时。
+  两种 ffmpeg 场景:
+    · 没扫到：在 <根>\ 下创建 bin\（下载/解压得到 ffmpeg）与 script\（工具本体）
+    · 扫到了：不复制、不新建 bin\，而是在 <根>\bin 建“目录联接”指向你已有的 ffmpeg 目录
+
+  想固定装到某个目录（脚本更改方法）：改下面 $DefaultParentDir 的值即可。
 #>
 param(
     [ValidateSet('auto', 'download')]
     [string]$Mode = 'auto',
+    [string]$Target = '',
     [string]$Root = '',
+    [switch]$NoDownload,
     [switch]$Force,
     [switch]$DryRun,
     [string]$FfmpegZip = ''
 )
+
+# ---------------- 想固定装到某个目录？改这里（脚本更改方法）----------------
+# 没扫到 ffmpeg 时，会在该目录下创建 FFmpeg\（内含 bin\ 与 script\）。
+# 留空 = 安装器所在盘的 \Tool，即 X:\Tool\FFmpeg；也可写成 'D:\MyTools' 之类。
+$DefaultParentDir = ''
+# -------------------------------------------------------------------------
 
 $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch { }  # Tls12
@@ -86,6 +105,23 @@ function RootFromBinDir([string]$binDir) {
     return $binDir
 }
 
+# 在 <根>\bin 建一个“目录联接（junction）”指向已有的 ffmpeg 目录：
+# 这样不用复制一份 ffmpeg，布局仍然是统一的 <根>\bin（mklink /J 不需要管理员权限）。
+function New-BinLink([string]$linkPath, [string]$targetPath) {
+    try {
+        if (Test-Path -LiteralPath $linkPath) { return $false }
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $linkPath) | Out-Null
+        & cmd.exe /c mklink /J $linkPath $targetPath | Out-Null
+        return (Test-Path -LiteralPath (Join-Path $linkPath 'ffmpeg.exe'))
+    } catch { return $false }
+}
+
+# 目录里是否同时具备 ffmpeg.exe 与 ffprobe.exe
+function Has-Tools([string]$dir) {
+    if (-not $dir) { return $false }
+    return ((Test-Path -LiteralPath (Join-Path $dir 'ffmpeg.exe')) -and (Test-Path -LiteralPath (Join-Path $dir 'ffprobe.exe')))
+}
+
 function Download([string]$url, [string]$dest) {
     $old = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
@@ -130,44 +166,64 @@ if (-not (Test-Path -LiteralPath (Join-Path $SrcRepo 'core\vpipe.py'))) {
 
 # ---------- 1. 解析安装根 / ffmpeg 目录 ----------
 $detected = Find-FfmpegDir
-$Root = if ($Root) { Norm $Root } else { '' }
+if ($Root) { $Root = Norm $Root }
 
 if ($Root) {
-    if (Test-Path -LiteralPath (Join-Path $Root 'ffmpeg.exe')) {
-        $FfmpegDir = $Root
-    } elseif (Test-Path -LiteralPath (Join-Path $Root 'bin\ffmpeg.exe')) {
-        $FfmpegDir = Join-Path $Root 'bin'
-    } else {
-        $FfmpegDir = Join-Path $Root 'bin'
-        if ($detected) { Warn "指定根内没有 ffmpeg，将复用已检测到的: $detected" }
-    }
-    Info "安装根（-Root 指定）: $Root"
+    Info "安装根（-Root 指定）: $Root"                      # 高级用法：直接给出安装根本身
+} elseif ($Target) {
+    $t = Norm $Target
+    $Root = if ((Split-Path -Leaf $t) -ieq 'FFmpeg') { $t } else { Join-Path $t 'FFmpeg' }
+    Info "安装根（-Target 指定）: $Root"
+} elseif ($detected) {
+    $Root = RootFromBinDir $detected
+    Good "检测到 ffmpeg: $detected"
+    Info "将安装到它的同级目录: $Root"
 } else {
-    if ($detected) {
-        $FfmpegDir = $detected
-        $Root = RootFromBinDir $FfmpegDir
-        Good "检测到 ffmpeg: $FfmpegDir"
-        Info "将安装到它的同级目录: $Root"
-    } else {
-        $drive = Split-Path -Qualifier $SrcRepo          # 例如 "C:"
-        $Root = Norm ($drive + '\Tool\FFmpeg')
-        $FfmpegDir = Join-Path $Root 'bin'
-        Warn "未检测到 ffmpeg，默认安装到当前盘: $Root"
-    }
+    $base = $DefaultParentDir
+    if (-not $base) { $base = (Split-Path -Qualifier $SrcRepo) + '\Tool' }   # 例如 "C:\Tool"
+    $Root = Norm (Join-Path $base 'FFmpeg')
+    Warn "未检测到 ffmpeg，默认安装到: $Root"
 }
 
 $ScriptDir = Join-Path $Root 'script'
-$needFfmpeg = -not ((Test-Path -LiteralPath (Join-Path $FfmpegDir 'ffmpeg.exe')) -and (Test-Path -LiteralPath (Join-Path $FfmpegDir 'ffprobe.exe')))
+$BinDir = Join-Path $Root 'bin'
+$FfmpegDir = ''
+$linked = $false
+$needFfmpeg = $false
+
+if (Has-Tools $BinDir) {
+    $FfmpegDir = $BinDir                                    # 根内已有可用的 bin\
+} elseif (Has-Tools $Root) {
+    $FfmpegDir = $Root                                      # ffmpeg 直接放在根内
+} elseif ($Mode -eq 'download' -or $FfmpegZip) {
+    $FfmpegDir = $BinDir                                    # 你明确要求下载 / 指定了 zip：优先获取
+    $needFfmpeg = $true
+} elseif (Has-Tools $detected) {
+    # 已有 ffmpeg：不复制、不新建 bin\，改为在 <根>\bin 建“联接”指向它
+    if (New-BinLink $BinDir $detected) {
+        $FfmpegDir = $BinDir
+        $linked = $true
+        Good "已在 $BinDir 建立联接 -> $detected（不复制、不额外占用空间）"
+    } else {
+        $FfmpegDir = $detected
+        Warn "无法建立 bin 联接，配置将直接指向: $detected"
+    }
+} else {
+    $FfmpegDir = $BinDir                                    # 没有可用 ffmpeg：需要在 bin\ 里获取
+    $needFfmpeg = $true
+}
 
 if ($DryRun) {
     $exists = Test-Path -LiteralPath $ScriptDir
     $ours = $exists -and (Test-Path -LiteralPath (Join-Path $ScriptDir 'core\vpipe.py'))
+    $ffDesc = if ($needFfmpeg) { '（需要获取：会先询问是否下载）' } elseif ($linked) { '（联接指向已有目录）' } else { '（已就绪）' }
+    $src = if ($FfmpegZip) { "指定来源: $FfmpegZip" } elseif ($needFfmpeg) { $ONLINE[0] } elseif ($linked) { "复用(联接) $detected" } else { $FfmpegDir }
     Info '------------------ 预演（不修改任何文件） ------------------'
     Info "安装根   : $Root"
     Info "工具目录 : $ScriptDir" + $(if (-not $exists) { '（新建）' } elseif ($ours) { '（已存在·本工具，将就地更新）' } else { '（已存在·非本工具，将需确认/备份）' })
-    Info "ffmpeg   : $FfmpegDir" + $(if ($needFfmpeg) { '（需要获取）' } else { '（已就绪）' })
+    Info "ffmpeg   : $FfmpegDir" + $ffDesc
     Info "工作目录 : $ScriptDir\core\_work"
-    Info "来源     : " + $(if ($FfmpegZip) { $FfmpegZip } elseif ($Mode -eq 'download') { $ONLINE[0] } elseif ($detected) { "复用 $detected" } else { '无（需改用自动下载入口）' })
+    Info "来源     : $src"
     Info '----------------------------------------------------------'
     exit 0
 }
@@ -220,49 +276,48 @@ if (Test-Path -LiteralPath $ScriptDir) {
 
 # ---------- 4. 获取 ffmpeg（如需要） ----------
 if ($needFfmpeg) {
-    New-Item -ItemType Directory -Force -Path $FfmpegDir | Out-Null
-    if ($FfmpegZip -or $Mode -eq 'download') {
-        if ($FfmpegZip) {
-            Info "使用指定来源: $FfmpegZip"
+    if ($NoDownload -and -not $FfmpegZip) {
+        Die "未检测到可用的 ffmpeg，且已指定 -NoDownload。请把手动准备好的 ffmpeg.exe / ffprobe.exe 放到 $BinDir 后重试。"
+    }
+    if (-not ($FfmpegZip -or $Mode -eq 'download')) {
+        if (-not (Yes "未检测到 ffmpeg。是否自动下载 essentials 版（主源 gyan.dev，约 109 MB；失败自动改用 BtbN 备用源）？")) {
+            Die "已取消：未获取 ffmpeg。可把 ffmpeg.exe / ffprobe.exe 手动放到 $BinDir，或用 -Mode download 直接下载后重试。"
+        }
+    }
+    New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+    if ($FfmpegZip) {
+        Info "使用指定来源: $FfmpegZip"
+        $zipPath = Join-Path $env:TEMP ('ffmpeg_easyuse_' + (Get-Date -Format 'yyyyMMddHHmmss') + '.zip')
+        $err = ''
+        try {
+            if ($FfmpegZip -match '^https?://') {
+                Info "下载中…（文件较大，请耐心等待）"
+                Download $FfmpegZip $zipPath
+            } else {
+                Copy-Item -LiteralPath $FfmpegZip -Destination $zipPath -Force
+            }
+            Install-FromZip $zipPath $BinDir $env:TEMP
+        } catch { $err = $_.Exception.Message } finally {
+            Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($err) { Die "获取 ffmpeg 失败: $err" }
+    } else {
+        $ok = $false
+        foreach ($u in $ONLINE) {
             $zipPath = Join-Path $env:TEMP ('ffmpeg_easyuse_' + (Get-Date -Format 'yyyyMMddHHmmss') + '.zip')
-            $err = ''
             try {
-                if ($FfmpegZip -match '^https?://') {
-                    Info "下载中…（文件较大，请耐心等待）"
-                    Download $FfmpegZip $zipPath
-                } else {
-                    Copy-Item -LiteralPath $FfmpegZip -Destination $zipPath -Force
-                }
-                Install-FromZip $zipPath $FfmpegDir $env:TEMP
-            } catch { $err = $_.Exception.Message } finally {
+                Info "下载中（essentials 版，约 109 MB）: $u"
+                Download $u $zipPath
+                Install-FromZip $zipPath $BinDir $env:TEMP
+                $ok = $true
+            } catch { Warn ("该来源失败: " + $_.Exception.Message) } finally {
                 Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
             }
-            if ($err) { Die "获取 ffmpeg 失败: $err" }
-        } else {
-            $ok = $false
-            foreach ($u in $ONLINE) {
-                $zipPath = Join-Path $env:TEMP ('ffmpeg_easyuse_' + (Get-Date -Format 'yyyyMMddHHmmss') + '.zip')
-                try {
-                    Info "下载中（essentials 版，约 100 MB）: $u"
-                    Download $u $zipPath
-                    Install-FromZip $zipPath $FfmpegDir $env:TEMP
-                    $ok = $true
-                } catch { Warn ("该来源失败: " + $_.Exception.Message) } finally {
-                    Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
-                }
-                if ($ok) { break }
-            }
-            if (-not $ok) { Die '自动下载 ffmpeg 失败（网络受限？）。可改用“一键安装(已有ffmpeg)”，或手动放置 ffmpeg.exe/ffprobe.exe 后重试。' }
+            if ($ok) { break }
         }
-    } elseif ($detected) {
-        Info "从已检测到的位置复制 ffmpeg 到 $FfmpegDir"
-        foreach ($n in @('ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe')) {
-            $s = Join-Path $detected $n
-            if (Test-Path -LiteralPath $s) { Copy-Item -LiteralPath $s -Destination (Join-Path $FfmpegDir $n) -Force }
-        }
-    } else {
-        Die "未检测到 ffmpeg。请改用“一键安装(自动下载ffmpeg)”入口，或先用 -Root 指定已有 ffmpeg 的目录。"
+        if (-not $ok) { Die '自动下载 ffmpeg 失败（网络受限？）。可先用 -FfmpegZip 指定本地 zip，或手动把 ffmpeg.exe / ffprobe.exe 放到 ' + $BinDir + ' 后重试。' }
     }
+    $FfmpegDir = $BinDir
 }
 
 if (-not (Test-Path -LiteralPath (Join-Path $FfmpegDir 'ffmpeg.exe'))) { Die "缺少 ffmpeg.exe: $FfmpegDir" }
