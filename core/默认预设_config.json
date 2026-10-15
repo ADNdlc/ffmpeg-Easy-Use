@@ -1,0 +1,41 @@
+{
+  "presets": [
+    {
+      "name": "屏幕录制 / 教程（体积小）",
+      "description": "HEVC CQ26，限制 30fps，适合录屏与讲解视频",
+      "base_profile": "hevc_nvenc",
+      "quality": 26,
+      "preset": "p6",
+      "resolution": { "max_long_side": 0, "max_fps": 30 }
+    },
+    {
+      "name": "手机 / 相机视频归档",
+      "description": "HEVC 高质量 CQ22，保留原分辨率与原帧率",
+      "base_profile": "hevc_nvenc_hq",
+      "quality": 22,
+      "preset": "p6",
+      "resolution": { "max_long_side": 0, "max_fps": 0 }
+    },
+    {
+      "name": "极致体积（画质优先的 AV1）",
+      "description": "AV1 CQ32，长边限制 1920，同画质体积最小",
+      "base_profile": "av1_nvenc",
+      "quality": 32,
+      "preset": "p7",
+      "resolution": { "max_long_side": 1920, "max_fps": 0 }
+    },
+    {
+      "name": "老旧设备兼容（720p H.264）",
+      "description": "H.264 CQ23，长边限制 1280，音频转 AAC 128k，任何设备都能播",
+      "base_profile": "h264_x264",
+      "quality": 23,
+      "preset": "slow",
+      "pix_fmt": "yuv420p",
+      "audio_mode": "aac",
+      "audio_bitrate": "128k",
+      "container": "mp4",
+      "resolution": { "max_long_side": 1280, "max_fps": 30 },
+      "flags": { "force": false, "include_filtered": false, "no_gpu": false }
+    }
+  ]
+}

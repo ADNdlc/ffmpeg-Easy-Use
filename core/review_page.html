@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vpipe 人工审阅 · 源 / 结果对比</title>
+<style>
+  :root{
+    --bg:#101316; --panel:#181d21; --panel2:#1e242a; --line:#2f373e; --line2:#3c454e;
+    --fg:#e8ecef; --fg2:#9aa4ad; --brand:#22a37a; --danger:#d9603f; --warn:#d9c07a;
+    --radius:8px; --mono:ui-monospace,Consolas,"Cascadia Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{margin:0; background:var(--bg); color:var(--fg); font-size:14px;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       display:flex; flex-direction:column; overflow:hidden;}
+  .flag{background:var(--panel2); color:var(--fg2); font-size:12px; padding:5px 12px; border-bottom:1px solid var(--line);
+        display:flex; align-items:center; gap:10px;}
+  .flag .root{font-family:var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;}
+  .flag b{color:var(--brand);}
+  .flag .mini{font-size:11.5px; padding:3px 9px;}
+  header.top{display:flex; align-items:baseline; gap:14px; padding:9px 14px; background:var(--panel); border-bottom:1px solid var(--line);}
+  .fname{font-weight:600; font-size:15px;}
+  .fmeta{color:var(--fg2); font-size:12.5px; font-family:var(--mono);}
+  .spacer{flex:1;}
+  .pos{font-family:var(--mono); font-size:13px; color:var(--fg2);}
+  .warn{color:var(--warn); font-size:12px;}
+
+  .stage{position:relative; flex:1; min-height:180px; background:#000; overflow:hidden; cursor:ew-resize; touch-action:none;}
+  .layer{position:absolute; inset:0; width:100%; height:100%; object-fit:contain; display:block;}
+  .layer.res{clip-path:inset(0 0 0 var(--pos,50%));}
+  .divider{position:absolute; top:0; bottom:0; left:var(--pos,50%); width:2px; margin-left:-1px; background:var(--brand); pointer-events:none; z-index:3;}
+  .knob{position:absolute; top:50%; left:50%; width:30px; height:30px; margin:-15px 0 0 -15px; border-radius:50%;
+        background:var(--brand); color:#04140e; font-size:11px; letter-spacing:-1px;
+        display:flex; align-items:center; justify-content:center; box-shadow:0 0 0 2px rgba(0,0,0,.55);}
+  .lab{position:absolute; top:10px; font-size:12px; padding:3px 8px; border-radius:6px; z-index:4;
+       background:rgba(0,0,0,.55); border:1px solid var(--line2);}
+  .lab-l{left:10px;} .lab-r{right:10px; color:var(--brand);}
+  .hint{position:absolute; left:0; right:0; bottom:12px; text-align:center; color:var(--warn); font-size:12.5px; z-index:5;}
+  .bigmsg{position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center;
+          padding:20px; color:var(--fg2); font-size:13.5px; line-height:1.9; z-index:6; background:rgba(8,10,12,.72);}
+  .bigmsg[hidden]{display:none;}
+
+  .play{display:flex; align-items:center; gap:8px; padding:7px 12px; background:var(--panel); border-top:1px solid var(--line);}
+  .play .t{font-family:var(--mono); font-size:12px; color:var(--fg2); min-width:42px; text-align:center;}
+  #seek{flex:1; accent-color:var(--brand); height:4px;}
+  button{font-family:inherit; font-size:12.5px; color:var(--fg); background:var(--panel2);
+         border:1px solid var(--line2); border-radius:6px; padding:4px 9px; cursor:pointer;}
+  button:hover:not(:disabled){border-color:var(--brand);}
+  button:disabled{opacity:.45; cursor:default;}
+  select{font-family:inherit; font-size:12.5px; color:var(--fg); background:var(--panel2); border:1px solid var(--line2);
+         border-radius:6px; padding:4px 6px;}
+
+  /* 底栏用三列网格：中间列固定在正中，两侧内容再长也不会把 ‹ › 按钮挤得左右移动 */
+  .bar{display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); align-items:end; gap:10px;
+       padding:9px 12px 11px; background:var(--panel); border-top:1px solid var(--line);}
+  .cell{display:flex; flex-direction:column; gap:6px; min-width:0;}
+  .cell.left{justify-self:start;}
+  .cell.right{justify-self:end; align-items:flex-end;}
+  .cell.mid{justify-self:center; align-items:center; flex-direction:row; justify-content:center; gap:10px; padding-bottom:2px;}
+  .who{display:flex; align-items:center; gap:6px; color:var(--fg2); font-size:12.5px; max-width:100%;}
+  .who .nm{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:260px; color:var(--fg);}
+  .who .sz{font-family:var(--mono); color:var(--fg);}
+  .sw{display:flex; gap:6px;}
+  .tg{font-size:12px; padding:3px 10px; border-radius:20px; background:transparent;}
+  .tg.on[data-k="del"]{background:var(--danger); border-color:var(--danger); color:#fff;}
+  .tg.on[data-k="fil"]{background:var(--brand); border-color:var(--brand); color:#04140e;}
+  .tabs{display:flex; gap:4px; flex-wrap:wrap; justify-content:flex-end;}
+  .tab{font-size:11.5px; padding:2px 8px; border-radius:12px; background:transparent; font-family:var(--mono);}
+  .tab.act{background:var(--panel2); border-color:var(--brand); color:var(--brand);}
+  .nav{font-size:15px; padding:2px 0; width:46px; text-align:center;}
+  #pg{display:inline-block; min-width:66px; text-align:center;}
+  .ghost{background:transparent;}
+
+  .sheet{position:fixed; inset:0; background:rgba(6,8,10,.78); display:flex; align-items:center; justify-content:center; z-index:20;}
+  .sheet[hidden]{display:none;}
+  .sheet .box{background:var(--panel); border:1px solid var(--line2); border-radius:var(--radius); width:min(1240px,96vw);
+              max-height:90vh; overflow:auto; padding:18px 20px;}
+  .sheet h2{font-size:17px; margin:0 0 4px;}
+  .sheet h3{font-size:14px; margin:18px 0 6px; color:var(--fg2);}
+  .sheet .sub{color:var(--fg2); font-size:12.5px;}
+  table{width:100%; border-collapse:collapse; font-size:13px;}
+  th,td{text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top;}
+  th{color:var(--fg2); font-weight:500; font-size:12.5px;}
+  td.n{font-family:var(--mono); font-size:12.5px;}
+  td.c{width:34px;}
+  /* 汇总表按 colgroup 固定列宽：体积、状态只占需要的宽度且不换行，长内容（文件名、参数）才折行 */
+  table.tbl-fixed{table-layout:fixed;}
+  table.tbl-fixed td,table.tbl-fixed th{overflow-wrap:anywhere;}
+  .sz{white-space:nowrap;}
+  .nb{white-space:nowrap;}
+  .st .sub{margin-top:2px;}
+  .kindres{color:var(--brand);}
+  .kindsrc{color:var(--warn);}
+  .badge{font-size:11.5px; padding:1px 7px; border-radius:10px; border:1px solid var(--line2); color:var(--fg2);}
+  .badge.b{color:var(--brand); border-color:var(--brand);}
+  .badge.d{color:var(--danger); border-color:var(--danger);}
+  .badge.w{color:var(--warn); border-color:var(--warn);}
+  .sheet .foot{display:flex; justify-content:flex-end; gap:10px; margin-top:18px; align-items:center;}
+  .sheet .foot .spacer{flex:1;}
+  .toast{position:fixed; left:50%; bottom:26px; transform:translateX(-50%); background:var(--panel2);
+         border:1px solid var(--brand); color:var(--fg); padding:8px 16px; border-radius:20px; font-size:13px; z-index:30;
+         max-width:70vw; text-align:center;}
+  .toast[hidden]{display:none;}
+  .toast.err{border-color:var(--danger);}
+</style>
+</head>
+<body>
+
+<div class="flag">
+  <b>vpipe 审阅</b>
+  <span class="root" id="rootTxt">加载中…</span>
+  <span id="progTxt"></span>
+  <button class="mini" id="btnRescan" title="重新扫描目录">重新扫描</button>
+  <button class="mini" id="btnUndo" title="撤销上一步 (Ctrl+Z)">撤销</button>
+  <button class="mini" id="btnSum" title="查看汇总 (S)">汇总</button>
+  <button class="mini" id="btnQuit" title="关闭审阅服务">关闭服务</button>
+</div>
+
+<header class="top">
+  <div class="fname" id="fname">—</div>
+  <div class="fmeta" id="fmeta">—</div>
+  <div class="warn" id="fwarn"></div>
+  <div class="spacer"></div>
+  <div class="pos" id="pos">— / —</div>
+</header>
+
+<div class="stage" id="stage">
+  <video class="layer" id="vSrc" muted playsinline preload="metadata"></video>
+  <video class="layer res" id="vRes" muted playsinline preload="metadata"></video>
+  <div class="divider" id="divider"><span class="knob">&#9668;&#9658;</span></div>
+  <div class="lab lab-l" id="labSrc">源</div>
+  <div class="lab lab-r" id="labRes">结果</div>
+  <div class="hint" id="hint" hidden></div>
+  <div class="bigmsg" id="bigmsg" hidden></div>
+</div>
+
+<div class="play">
+  <button id="pp">▶</button>
+  <span class="t" id="tcur">0:00</span>
+  <input id="seek" type="range" min="0" max="1000" value="0">
+  <span class="t" id="tdur">0:00</span>
+  <button id="bwd">-5s</button>
+  <button id="fwd">+5s</button>
+  <button id="fmin">帧-</button>
+  <button id="fplus">帧+</button>
+  <select id="rate">
+    <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+    <option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option>
+  </select>
+</div>
+
+<footer class="bar">
+  <div class="cell left">
+    <div class="who">源 <span class="nm" id="sName">—</span> <span class="sz" id="sSize">—</span></div>
+    <div class="sw">
+      <button class="tg" id="sDel" data-k="del">删除</button>
+      <button class="tg" id="sFil" data-k="fil">过滤</button>
+    </div>
+  </div>
+  <div class="cell mid">
+    <button class="nav" id="prev">‹</button>
+    <span class="pos" id="pg">— / —</span>
+    <button class="nav" id="next">›</button>
+    <button class="ghost" id="sum">汇总</button>
+    <button class="ghost" id="jump" title="跳到下一个未审阅的项组">未审阅</button>
+  </div>
+  <div class="cell right">
+    <div class="who"><span class="tabs" id="tabs"></span> 结果 <span class="nm" id="rName">—</span> <span class="sz" id="rSize">—</span></div>
+    <div class="sw">
+      <button class="tg" id="rDel" data-k="del">删除</button>
+      <button class="tg" id="rFil" data-k="fil">过滤</button>
+    </div>
+  </div>
+</footer>
+
+<div class="sheet" id="sheet" hidden>
+  <div class="box" id="sheetBox"></div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script>
+(function(){
+  var Q = null;              // /api/queue 的返回
+  var gi = 0, ci = 0;        // 项组下标 / 当前结果下标
+  var playing = false, lastTs = 0, sumState = {checked:{}};
+  var el = function(id){ return document.getElementById(id); };
+  var stage=el('stage'), vSrc=el('vSrc'), vRes=el('vRes'), seek=el('seek'), toastEl=el('toast');
+
+  function fmt(t){
+    t = Math.max(0, t || 0);
+    var m = Math.floor(t/60), s = Math.floor(t%60);
+    return m + ':' + (s<10?'0':'') + s;
+  }
+  function g(){ return (Q && Q.groups[gi]) || null; }
+  function r(){ var gg=g(); return gg && gg.results[ci] ? gg.results[ci] : null; }
+  function srcIt(){ var gg=g(); return gg ? gg.src : null; }
+  function byPath(p){
+    if (!Q) return null;
+    var gg = Q.groups, i, j;
+    for (i=0;i<gg.length;i++){
+      if (gg[i].src && gg[i].src.path === p) return gg[i].src;
+      for (j=0;j<gg[i].results.length;j++) if (gg[i].results[j].path === p) return gg[i].results[j];
+    }
+    return null;
+  }
+  function say(msg, isErr){
+    toastEl.textContent = msg; toastEl.hidden = false;
+    toastEl.className = 'toast' + (isErr ? ' err' : '');
+    clearTimeout(say._t); say._t = setTimeout(function(){ toastEl.hidden = true; }, 3200);
+  }
+  function api(path, body){
+    var opt = {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})};
+    return fetch(path, opt).then(function(r){ return r.json().catch(function(){ return {error:'服务返回异常'}; }); });
+  }
+
+  // ---------- 加载与渲染
+  function load(keepPos, rescan){
+    var g0 = gi, c0 = ci;
+    return fetch('/api/queue' + (rescan ? '?rescan=1' : '')).then(function(r){ return r.json(); }).then(function(d){
+      if (d.error){ say(d.error, true); return; }
+      Q = d;
+      var n = Q.groups.length;
+      if (!n){
+        el('fname').textContent = '目录里没有可审阅的视频';
+        el('bigmsg').hidden = false;
+        el('bigmsg').textContent = '源目录里没有视频文件。\n把你需要压缩的视频放进目录后点「重新扫描」。';
+        return;
+      }
+      if (keepPos) { gi = Math.min(g0, n-1); ci = Math.min(c0, (Q.groups[gi].results.length-1)); }
+      else { gi = Math.min(Q.start_index || 0, n-1); ci = 0; }
+      if (ci < 0) ci = 0;
+      el('rootTxt').textContent = Q.root || '';
+      if (Q.scan && Q.scan.error) say(Q.scan.error, true);
+      showGroup(true);
+      paintProgress();
+    }).catch(function(e){ say('无法连接审阅服务：' + e, true); });
+  }
+
+  function paintProgress(){
+    var p = (Q && Q.progress) || {total:0, checked:0};
+    var n = Q ? Q.groups.length : 0;
+    el('progTxt').innerHTML = '共 <b>' + n + '</b> 组 / <b>' + p.total + '</b> 项 · 未审阅 <b>' + p.checked + '</b>';
+    el('pg').textContent = (gi+1) + ' / ' + n;
+    el('pos').textContent = (gi+1) + ' / ' + n;
+  }
+
+  function renderTabs(){
+    var wrap = el('tabs'); wrap.innerHTML = '';
+    var gg = g(); if (!gg) return;
+    gg.results.forEach(function(res, i){
+      var b = document.createElement('button');
+      b.className = 'tab' + (i === ci ? ' act' : '');
+      b.textContent = res.tag || ('结果' + (i+1));
+      b.title = res.name;
+      b.onclick = function(){ ci = i; syncUI(); renderTabs(); loadMedia(); };
+      wrap.appendChild(b);
+    });
+  }
+
+  function mediaUrl(it){
+    return (it && it.exists && it.media) ? it.media : '';
+  }
+
+  function setMedia(v, url){
+    var cur = v.getAttribute('src') || '';
+    if (url === cur) return;
+    try {
+      if (url){ v.src = url; v.load(); }
+      else { v.removeAttribute('src'); v.load(); }
+    } catch(e){}
+  }
+
+  function loadMedia(){
+    var s = srcIt(), rr = r();
+    var su = mediaUrl(s), ru = mediaUrl(rr);
+    setMedia(vSrc, su); setMedia(vRes, ru);
+    var msg = '';
+    if (!su) msg = '源文件不存在或已移走，无法播放对比（仍可设置开关）。';
+    else if (!ru) msg = '这一组还没有转换结果（只有源文件）。';
+    el('bigmsg').hidden = !msg;
+    if (msg) el('bigmsg').textContent = msg;
+    el('hint').hidden = true;
+    seekTo(0);
+  }
+
+  function syncUI(){
+    var s = srcIt(), rr = r(), gg = g();
+    if (!gg) return;
+    el('fname').textContent = (s ? s.name : (gg.src_path || '').split(/[\\/]/).pop()) || '（源已不存在）';
+    el('fmeta').textContent = (s ? s.meta_text : '—') + (rr ? ('   →   ' + rr.meta_text) : '');
+    el('fwarn').textContent = (s && s.warn) || '';
+    el('sName').textContent = s ? s.name : '（源已不存在）';
+    el('sSize').textContent = s ? s.size_text : '';
+    el('sDel').classList.toggle('on', !!(s && s.delete));
+    el('sFil').classList.toggle('on', !!(s && s.filtered));
+    el('sDel').disabled = el('sFil').disabled = !s || !!s.cleaned;
+    el('rName').textContent = rr ? rr.name : '—';
+    el('rSize').textContent = rr ? (rr.size_text + (s && s.size ? ('，省 ' + Math.max(0, Math.round(100 - rr.size/s.size*100)) + '%') : '')) : '';
+    el('rDel').classList.toggle('on', !!(rr && rr.delete));
+    el('rFil').classList.toggle('on', !!(rr && rr.filtered));
+    el('rDel').disabled = el('rFil').disabled = !rr || !!rr.cleaned;
+    el('labSrc').textContent = '源' + (s && s.filtered ? ' · 已过滤' : '') + (s && s.delete ? ' · 待删' : '');
+    el('labRes').textContent = rr ? ('结果 · ' + (rr.tag || '')) : '结果';
+    paintProgress();
+  }
+
+  function showGroup(resetTime){
+    if (resetTime){ playing = false; setPlay(false); }
+    syncUI(); renderTabs(); loadMedia();
+  }
+  function go(d){
+    var n = Q ? Q.groups.length : 0;
+    if (gi + d < 0 || gi + d >= n){ say(d < 0 ? '已经是第一组' : '已经是最后一组'); return; }
+    gi += d; ci = 0; showGroup(true);
+  }
+  function jumpUnreviewed(){
+    var n = Q ? Q.groups.length : 0, i, k, gg;
+    for (k=1;k<=n;k++){
+      i = (gi + k) % n;
+      gg = Q.groups[i];
+      var list = (gg.src ? [gg.src] : []).concat(gg.results);
+      for (var j=0;j<list.length;j++){
+        if (!list[j].reviewed && !list[j].cleaned){ gi = i; ci = 0; showGroup(true); say('已跳到未审阅的项组'); return; }
+      }
+    }
+    say('所有项都已看过');
+  }
+
+  // ---------- 播放与同步
+  // 结果视频只是“跟随”源视频：只有在两侧都稳定播放时才偶尔纠偏。
+  // 一旦正在 seek 或刚手动定位过，就绝不再去改它的 currentTime——否则浏览器会不停打断
+  // 结果视频的解码/缓冲，表现为拖动进度条后右侧结果卡顿甚至停住。
+  var scrubbing = false, syncHold = 0, lastFix = 0, scrubTimer = 0, scrubResume = false, scrubLast = 0;
+  function cur(){ return vSrc.currentTime || 0; }
+  function dur(){ return vSrc.duration || 0; }
+  function seekTo(t){
+    t = Math.max(0, Math.min(dur() || 0, t));
+    syncHold = performance.now() + 320;     // 给两侧留出完成本次 seek 的时间
+    try { vSrc.currentTime = t; } catch(e){}
+    try { vRes.currentTime = t; } catch(e){}
+    paint();
+  }
+  function setPlay(p){
+    playing = p;
+    el('pp').textContent = p ? '⏸' : '▶';
+    try { p ? (vSrc.play(), vRes.play()) : (vSrc.pause(), vRes.pause()); } catch(e){}
+  }
+  function paint(){
+    var ct = cur(), d = dur();
+    // 拖动中：进度条与时间读数都以拖动位置为准（由 scrubInput 直接写入），不被源的旧时间覆盖，
+    // 否则会出现「手指在这里、读数还停在上一帧」的错位。
+    if (!scrubbing){
+      seek.value = d ? String(Math.round(ct/d*1000)) : '0';
+      el('tcur').textContent = fmt(ct);
+    }
+    el('tdur').textContent = fmt(d);
+  }
+  function resync(){
+    if (!vSrc.duration || vRes.paused || vSrc.seeking || vRes.seeking) return;
+    var now = performance.now();
+    if (scrubbing || now < syncHold || now - lastFix < 500) return;   // 限频，避免持续微调造成抖动
+    if (Math.abs(vSrc.currentTime - vRes.currentTime) > 0.15){
+      lastFix = now;
+      try { vRes.currentTime = vSrc.currentTime; } catch(e){}
+    }
+  }
+  function tick(){
+    // 兜底：拖动收尾事件万一丢失（指针在控件外松开、切走窗口等），静默 1.2s 后自动收尾。
+    // 否则 scrubbing 会一直是 true——进度条不再刷新、结果视频也不再纠偏，看起来就像卡死。
+    if (scrubbing && performance.now() - scrubLast > 1200) scrubEnd();
+    resync(); paint();
+    requestAnimationFrame(tick);
+  }
+
+  function bindSync(){
+    vSrc.addEventListener('play', function(){
+      playing = true; el('pp').textContent = '⏸';
+      try { vRes.currentTime = vSrc.currentTime; } catch(e){}
+      try { vRes.play(); } catch(e){}
+    });
+    vSrc.addEventListener('pause', function(){
+      playing = false; el('pp').textContent = '▶';
+      try { vRes.pause(); } catch(e){}
+    });
+    vSrc.addEventListener('ratechange', function(){
+      try { vRes.playbackRate = vSrc.playbackRate; } catch(e){}
+    });
+    vSrc.addEventListener('ended', function(){
+      try { vRes.pause(); } catch(e){}
+      playing = false; el('pp').textContent = '▶';
+    });
+    // 源完成定位后才把结果跟到同一时间点；这是唯一的一次性“跟随”，不会反复打断结果视频
+    vSrc.addEventListener('seeked', function(){
+      if (vRes.seeking) return;
+      try { vRes.currentTime = vSrc.currentTime; } catch(e){}
+    });
+    ['error','stalled'].forEach(function(ev){
+      vSrc.addEventListener(ev, function(){ if (!srcIt() || !srcIt().exists) return;
+        el('hint').hidden = false; el('hint').textContent = '源视频读取失败，可能文件已移动或被其它程序占用。'; });
+    });
+  }
+
+  // ---------- 开关
+  function toggle(it, flag){
+    if (!it || it.cleaned) return;
+    api('/api/toggle', {path: it.path, flag: flag, value: !it[flag]}).then(function(d){
+      if (d.error){ say(d.error, true); return; }
+      it[flag] = d.item[flag]; it.reviewed = d.item.reviewed;
+      if (Q) Q.progress = d.progress;
+      syncUI(); renderTabs();
+      say((flag === 'delete' ? '删除' : '过滤') + ' 已' + (it[flag] ? '打开' : '关闭') + '：' + it.name);
+    });
+  }
+  function undo(){
+    api('/api/undo', {}).then(function(d){
+      if (d.error){ say(d.error, true); return; }
+      say(d.message);
+      load(true);
+    });
+  }
+  function rescan(){
+    api('/api/rescan', {}).then(function(d){
+      if (d.error){ say(d.error, true); return; }
+      say('已重新扫描：新增 ' + d.scan.added + '，移除 ' + d.scan.dropped + '，异常 ' + d.scan.warned);
+      load(true);
+    });
+  }
+
+  // ---------- 汇总与执行
+  function esc(s){
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+    });
+  }
+  function fmtSize(n){
+    n = Number(n) || 0;
+    var u = ['B','KB','MB','GB','TB'], i = 0;
+    while (n >= 1024 && i < u.length - 1){ n /= 1024; i++; }
+    return (i === 0 ? Math.round(n) : n.toFixed(1)) + ' ' + u[i];
+  }
+  function sumChecked(){ return Object.keys(sumState.checked).filter(function(k){ return sumState.checked[k]; }); }
+
+  function openSum(){
+    fetch('/api/summary').then(function(r){ return r.json(); }).then(function(s){
+      if (s.error){ say(s.error, true); return; }
+      sumState = {data: s, checked: {}};
+      s.delete.forEach(function(row){ sumState.checked[row.path] = true; });
+      el('sheet').hidden = false;
+      renderSum();
+    }).catch(function(e){ say('无法获取汇总：' + e, true); });
+  }
+
+  function rowHtml(row){
+    var kind = row.kind === 'source'
+      ? '<span class="kindsrc">源</span>' : '<span class="kindres">结果</span>';
+    var badges = '';
+    if (row.filtered) badges += '<span class="badge b">过滤</span> ';
+    if (row.warn) badges += '<span class="badge w">' + esc(row.warn) + '</span> ';
+    if (!row.valid) badges += '<span class="badge d">失效</span>';
+    // 标签整体不换行；失效原因单独占一行，允许折行
+    var tags = badges ? ('<span class="nb">' + badges + '</span>') : '';
+    var reason = (!row.valid && row.invalid_reason)
+      ? ('<div class="sub">' + esc(row.invalid_reason) + '</div>') : '';
+    var save = (row.saving === undefined) ? '' : ('，省 ' + Math.max(0, Math.round(row.saving)) + '%');
+    return '<tr>' +
+      '<td class="c"><input type="checkbox" data-p="' + esc(row.path) + '"' +
+        (sumState.checked[row.path] ? ' checked' : '') + '></td>' +
+      '<td>' + kind + '</td>' +
+      '<td class="n">' + esc(row.name) + '</td>' +
+      '<td class="n">' + esc(row.meta_text) + '</td>' +
+      '<td class="n sz">' + esc(row.size_text) + save + '</td>' +
+      '<td class="st">' + tags + reason + '</td></tr>';
+  }
+
+  function tableHtml(rows){
+    if (!rows.length) return '<table><tbody><tr><td class="sub">（无）</td></tr></tbody></table>';
+    // 列宽：勾选/类型/文件/参数/体积/状态——参数列留最宽，体积与状态按其内容宽度固定，避免被挤到换行
+    var head = '<colgroup><col style="width:40px"><col style="width:64px"><col style="width:21%">' +
+               '<col style="width:27%"><col style="width:14%"><col></colgroup>' +
+               '<thead><tr><th class="c"></th><th>类型</th><th>文件</th><th>分辨率 / 参数</th><th>体积</th><th>状态</th></tr></thead>';
+    return '<table class="tbl-fixed">' + head + '<tbody>' + rows.map(rowHtml).join('') + '</tbody></table>';
+  }
+
+  function renderSum(){
+    var s = sumState.data, i;
+    var checkedPaths = sumChecked();
+    var bytes = 0, srcCount = 0;
+    var all = [];
+    for (i = 0; i < s.delete.length; i++) all.push(s.delete[i]);
+    for (i = 0; i < s.keep.length; i++) all.push(s.keep[i]);
+    for (i = 0; i < all.length; i++){
+      if (checkedPaths.indexOf(all[i].path) >= 0){ bytes += all[i].size; if (all[i].kind === 'source') srcCount++; }
+    }
+    var staleInChecked = 0;
+    for (i = 0; i < s.delete.length; i++){
+      if (sumState.checked[s.delete[i].path] && !s.delete[i].valid) staleInChecked++;
+    }
+    el('sheetBox').innerHTML =
+      '<h2>汇总确认</h2>' +
+      '<div class="sub">' + esc(Q ? Q.root : '') + ' · 已勾选 <b>' + checkedPaths.length +
+        '</b> 项，约 ' + fmtSize(bytes) + '（其中源文件 ' + srcCount + ' 项）' +
+        (s.unreviewed ? ' · 还有 <b>' + s.unreviewed + '</b> 项未审阅' : '') + '</div>' +
+      (staleInChecked ? '<div class="sub" style="color:var(--danger)">删除清单里有 ' + staleInChecked +
+        ' 项记录已失效（文件被改动或移动），执行时会被自动跳过。</div>' : '') +
+      '<h3>删除清单（勾选即送回收站）</h3>' + tableHtml(s.delete) +
+      '<h3>保留清单（勾选可临时加入删除）</h3>' + tableHtml(s.keep) +
+      '<div class="foot"><span class="sub">执行顺序：先删结果、最后删源；全部进回收站，可回滚。</span>' +
+      '<span class="spacer"></span>' +
+      '<button class="ghost" id="sumClose">继续审阅</button>' +
+      '<button id="sumApply">确认执行（' + checkedPaths.length + '）</button></div>';
+    el('sheetBox').querySelectorAll('input[type=checkbox]').forEach(function(cb){
+      cb.onchange = function(){ sumState.checked[cb.getAttribute('data-p')] = cb.checked; renderSum(); };
+    });
+    el('sumClose').onclick = function(){ el('sheet').hidden = true; };
+    el('sumApply').onclick = function(){ apply(false); };
+  }
+
+  function apply(confirmSource){
+    var paths = sumChecked();
+    if (!paths.length){ say('没有勾选任何项'); return; }
+    el('sumApply').disabled = true;
+    api('/api/apply', {delete: paths, confirm_source: !!confirmSource}).then(function(d){
+      if (d.error){ say(d.error, true); return; }
+      renderReport(d.report, confirmSource);
+      load(true);
+    });
+  }
+
+  function reportRow(x){
+    var cls = x.status === 'recycled' ? 'b' : (x.status === 'failed' ? 'd' : 'w');
+    var txt = x.status === 'recycled' ? '已送回收站' : (x.status === 'failed' ? '失败' : '跳过');
+    return '<tr><td>' + (x.kind === 'source' ? '<span class="kindsrc">源</span>' : '<span class="kindres">结果</span>') +
+      '</td><td class="n">' + esc(x.name) + '</td><td class="n sz">' + esc(x.size_text || '') +
+      '</td><td><span class="nb badge ' + cls + '">' + txt + '</span> ' + esc(x.reason || '') + '</td></tr>';
+  }
+
+  function renderReport(rep, confirmSource){
+    var rows = (rep.rows || []).map(reportRow).join('');
+    var skipped = (rep.skipped_rows || []).map(reportRow).join('');
+    var needConfirm = (rep.skipped_rows || []).some(function(x){
+      return (x.reason || '').indexOf('组内没有保留') >= 0;
+    });
+    el('sheetBox').innerHTML =
+      '<h2>执行报告</h2>' +
+      '<div class="sub">回收站删除 <b>' + rep.ok + '</b> 项（' + rep.bytes_text + '）· 失败 <b>' + rep.failed +
+        '</b> 项 · 跳过 <b>' + rep.skipped + '</b> 项 · ' + esc(rep.at) + '</div>' +
+      '<h3>已执行</h3>' + (rows ? '<table><thead><tr><th>类型</th><th>文件</th><th>体积</th><th>结果</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<div class="sub">（无）</div>') +
+      (skipped ? '<h3>未执行（跳过）</h3><table><thead><tr><th>类型</th><th>文件</th><th>体积</th><th>原因</th></tr></thead><tbody>' + skipped + '</tbody></table>' : '') +
+      (rep.failed ? '<div class="sub" style="color:var(--danger)">失败的项文件仍在原位，可稍后重试（常见原因：文件被播放器占用）。</div>' : '') +
+      '<div class="foot"><span class="spacer"></span>' +
+      (needConfirm ? '<button class="ghost" id="repForce">仍要删除这些源（确认）</button>' : '') +
+      '<button id="repClose">关闭</button></div>';
+    if (needConfirm){
+      el('repForce').onclick = function(){ apply(true); };
+    }
+    el('repClose').onclick = function(){ el('sheet').hidden = true; };
+  }
+
+  function shutdown(){
+    if (!window.confirm('关闭审阅服务？（所有开关已即时保存）')) return;
+    api('/api/shutdown', {}).then(function(){ say('审阅服务已关闭，本页可以关掉了'); });
+  }
+
+  // ---------- 交互绑定
+  function follow(e){
+    var rct = stage.getBoundingClientRect();
+    if (!rct.width) return;
+    var p = Math.max(2, Math.min(98, (e.clientX - rct.left) / rct.width * 100));
+    stage.style.setProperty('--pos', p.toFixed(2) + '%');
+  }
+  stage.addEventListener('pointermove', follow);
+  stage.addEventListener('mousemove', follow);
+  stage.addEventListener('pointerdown', function(e){ e.preventDefault(); });
+  stage.style.setProperty('--pos', '50%');
+
+  el('pp').onclick = function(){ setPlay(!playing); };
+  el('bwd').onclick = function(){ seekTo(cur() - 5); };
+  el('fwd').onclick = function(){ seekTo(cur() + 5); };
+  el('fmin').onclick = function(){ seekTo(cur() - 1 / ((r() && r().fps) || 30)); };
+  el('fplus').onclick = function(){ seekTo(cur() + 1 / ((r() && r().fps) || 30)); };
+  el('rate').onchange = function(){
+    var v = parseFloat(el('rate').value) || 1;
+    try { vSrc.playbackRate = v; vRes.playbackRate = v; } catch(e){}
+  };
+  // 拖动进度条：一拖动就暂停播放，拖动期间只对源做「一次一个」的低频预览定位
+  //（上一次 seek 没结束就不发下一次），松手时再把源与结果一次性对齐到最终位置并恢复播放。
+  // 这样既不会每帧重复 seek 把解码管线打断（小概率卡死），也不会出现拖动时播放仍在推进、
+  // 松手后进度条与画面各说各话的错位。
+  function scrubTarget(){
+    var d = dur();
+    if (!d) return -1;                       // 时长（元数据）还没到位就先不响应拖动，避免被夹到 0
+    return parseFloat(seek.value) / 1000 * d;
+  }
+  function scrubBegin(){
+    if (scrubbing) return;
+    scrubbing = true;
+    scrubResume = playing;
+    if (playing) setPlay(false);             // 先暂停，免得播放推进与 seek 互相打架
+  }
+  function scrubPreview(){
+    scrubTimer = 0;
+    if (!scrubbing) return;
+    var t = scrubTarget();
+    if (t < 0) return;
+    syncHold = performance.now() + 320;
+    if (!vSrc.seeking){ try { vSrc.currentTime = t; } catch(e){} }
+    paint();
+  }
+  function scrubInput(){
+    var t = scrubTarget();
+    if (t < 0) return;
+    scrubBegin();
+    scrubLast = performance.now();
+    el('tcur').textContent = fmt(t);
+    if (!scrubTimer) scrubTimer = requestAnimationFrame(scrubPreview);
+  }
+  function scrubEnd(){
+    if (!scrubbing) return;
+    scrubbing = false;
+    scrubLast = 0;
+    if (scrubTimer){ cancelAnimationFrame(scrubTimer); scrubTimer = 0; }
+    var t = scrubTarget();
+    if (t >= 0) seekTo(t);                   // 源与结果一次性对齐到最终位置
+    if (scrubResume) setPlay(true);
+    scrubResume = false;
+  }
+  seek.oninput = scrubInput;
+  seek.onchange = scrubEnd;
+  // 松手 / 取消可能发生在控件之外：用 window 兜底，保证 scrubbing 一定被清掉
+  window.addEventListener('pointerup', scrubEnd);
+  window.addEventListener('pointercancel', scrubEnd);
+  window.addEventListener('blur', scrubEnd);
+  el('prev').onclick = function(){ go(-1); };
+  el('next').onclick = function(){ go(1); };
+  el('jump').onclick = jumpUnreviewed;
+  el('sum').onclick = openSum;
+  el('btnSum').onclick = openSum;
+  el('btnUndo').onclick = undo;
+  el('btnRescan').onclick = rescan;
+  el('btnQuit').onclick = shutdown;
+  el('sDel').onclick = function(){ toggle(srcIt(), 'delete'); };
+  el('sFil').onclick = function(){ toggle(srcIt(), 'filtered'); };
+  el('rDel').onclick = function(){ toggle(r(), 'delete'); };
+  el('rFil').onclick = function(){ toggle(r(), 'filtered'); };
+  el('sheet').addEventListener('click', function(e){ if (e.target === el('sheet')) el('sheet').hidden = true; });
+
+  window.addEventListener('beforeunload', function(){ try { vSrc.pause(); vRes.pause(); } catch(e){} });
+
+  document.addEventListener('keydown', function(e){
+    var k = e.key;
+    if ((e.ctrlKey || e.metaKey) && (k === 'z' || k === 'Z')){ e.preventDefault(); undo(); return; }
+    if (!el('sheet').hidden){ if (k === 'Escape') el('sheet').hidden = true; return; }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (k === ' '){ e.preventDefault(); setPlay(!playing); return; }
+    // 进度条本身还带着焦点时，左右键交给它自己处理，避免和这里的 ±5s 重复跳动、把进度与画面对不上
+    if (e.target === seek && (k === 'ArrowLeft' || k === 'ArrowRight')) return;
+    if (k === 'ArrowLeft'){ seekTo(cur() - (e.shiftKey ? 30 : 5)); return; }
+    if (k === 'ArrowRight'){ seekTo(cur() + (e.shiftKey ? 30 : 5)); return; }
+    if (k === '['){ seekTo(cur() - 1 / ((r() && r().fps) || 30)); return; }
+    if (k === ']'){ seekTo(cur() + 1 / ((r() && r().fps) || 30)); return; }
+    if (k === ','){ go(-1); return; }
+    if (k === '.'){ go(1); return; }
+    if (k === 'n' || k === 'N'){ jumpUnreviewed(); return; }
+    if (k === 's' || k === 'S'){ openSum(); return; }
+    if (k === 'r' || k === 'R'){ rescan(); return; }
+    if (k === 'd' || k === 'D'){ toggle(e.shiftKey ? r() : srcIt(), 'delete'); return; }
+    if (k === 'f' || k === 'F'){ toggle(e.shiftKey ? r() : srcIt(), 'filtered'); return; }
+    if (k >= '1' && k <= '9'){
+      var i = +k - 1;
+      if (g() && i < g().results.length){ ci = i; syncUI(); renderTabs(); loadMedia(); }
+    }
+  });
+
+  // ---------- 启动
+  bindSync();
+  load(false, true);      // 首次进入按文件系统重新扫描，源文件被还原/新结果生成都能被识别
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>

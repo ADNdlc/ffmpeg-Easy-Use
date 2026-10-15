@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ffmpeg 批量压缩 · 统一入口</title>
+<style>
+  :root{
+    --bg:#101316; --panel:#181d21; --panel2:#1e242a; --line:#2f373e; --line2:#3c454e;
+    --fg:#e8ecef; --fg2:#9aa4ad; --fg3:#6d7780; --brand:#22a37a; --brand2:#1c8a68;
+    --danger:#d9603f; --warn:#d9c07a; --info:#4f9dd9;
+    --radius:8px; --mono:ui-monospace,Consolas,"Cascadia Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0; background:var(--bg); color:var(--fg); font-size:14px; line-height:1.6;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}
+  .wrap{max-width:1080px; margin:0 auto; padding:14px 16px 40px;}
+  header{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; padding-bottom:10px;
+         border-bottom:1px solid var(--line); margin-bottom:14px;}
+  h1{font-size:17px; margin:0;}
+  .sub{color:var(--fg2); font-size:12.5px; font-family:var(--mono); flex:1;
+       overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  h2{font-size:14px; margin:0 0 8px; color:var(--fg2); font-weight:600;
+     display:flex; align-items:center; gap:8px;}
+  h2 .hint{font-weight:400; font-size:12px; color:var(--fg3);}
+  section{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+          padding:12px 14px; margin-bottom:12px;}
+  .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+  .grid{display:grid; gap:10px;}
+  label{font-size:12.5px; color:var(--fg2);}
+  input[type=text],input[type=number],select,textarea{
+    font-family:inherit; font-size:13px; color:var(--fg); background:var(--panel2);
+    border:1px solid var(--line2); border-radius:6px; padding:5px 8px;}
+  textarea{width:100%; min-height:52px; resize:vertical; font-family:var(--mono); font-size:12.5px;}
+  input[type=text]{min-width:180px;}
+  input:focus,select:focus,textarea:focus{outline:none; border-color:var(--brand);}
+  input[type=range]{accent-color:var(--brand); width:180px; vertical-align:middle;}
+  button{font-family:inherit; font-size:12.5px; color:var(--fg); background:var(--panel2);
+         border:1px solid var(--line2); border-radius:6px; padding:5px 11px; cursor:pointer;}
+  button:hover:not(:disabled){border-color:var(--brand);}
+  button:disabled{opacity:.42; cursor:default;}
+  button.primary{background:var(--brand); border-color:var(--brand); color:#04140e; font-weight:600;
+                 padding:7px 20px; font-size:13.5px;}
+  button.primary:hover:not(:disabled){background:var(--brand2);}
+  button.danger{border-color:var(--danger); color:var(--danger);}
+  .ghost{background:transparent;}
+  .mini{font-size:11.5px; padding:2px 8px;}
+
+  .cards{display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:9px;}
+  .card{border:1px solid var(--line2); border-radius:7px; padding:8px 10px; cursor:pointer;
+        background:var(--panel2); transition:border-color .12s;}
+  .card:hover{border-color:var(--fg3);}
+  .card.on{border-color:var(--brand); background:#132a24;}
+  .card .t{font-size:13px; font-weight:600;}
+  .card .d{font-size:11.5px; color:var(--fg2);}
+  .card .enc{font-family:var(--mono); font-size:11px; color:var(--fg3);}
+
+  .paths{list-style:none; margin:0; padding:0; max-height:190px; overflow:auto;}
+  .paths li{display:flex; align-items:center; gap:8px; padding:4px 0;
+            border-bottom:1px solid #232a30; font-family:var(--mono); font-size:12.5px;}
+  .paths li:last-child{border-bottom:none;}
+  .paths .p{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .paths .k{font-size:11px; color:var(--fg3);}
+  .empty{color:var(--fg3); font-size:12.5px; font-family:inherit;}
+  .tip{background:#132029; border:1px solid #24404f; color:var(--info);
+       border-radius:6px; padding:7px 11px; font-size:12.5px; margin-bottom:12px;}
+  .tip b{color:var(--fg);}
+
+  .bar{height:9px; border-radius:5px; background:var(--panel2); overflow:hidden; border:1px solid var(--line2);}
+  .bar > i{display:block; height:100%; width:0; background:var(--brand); transition:width .25s;}
+  .pgline{font-family:var(--mono); font-size:12.5px; color:var(--fg2); margin-top:6px;}
+  .pgline b{color:var(--fg);}
+  .log{margin-top:10px; background:#0c0f12; border:1px solid var(--line); border-radius:6px;
+       padding:8px 10px; height:200px; overflow:auto; font-family:var(--mono); font-size:12px;}
+  .log div{white-space:pre-wrap; word-break:break-all;}
+  .log .done{color:var(--brand);} .log .skip{color:var(--fg3);}
+  .log .fail{color:var(--danger);} .log .note{color:var(--info);}
+  .log .entry{color:var(--fg);} .log .progress{color:var(--fg3);}
+  .log .end{color:var(--warn); font-weight:600;} .log .start{color:var(--brand); font-weight:600;}
+
+  details{border:1px solid var(--line2); border-radius:7px; padding:8px 12px; background:var(--panel2);}
+  details summary{cursor:pointer; font-size:12.5px; color:var(--fg2);}
+  details .inner{padding-top:10px;}
+  .fld{display:flex; flex-direction:column; gap:4px; min-width:150px;}
+  .chk{display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--fg2);}
+  .msg{margin-top:10px; font-size:12.5px; color:var(--warn); min-height:1.2em;}
+  .msg.err{color:var(--danger);} .msg.ok{color:var(--brand);}
+  .tagline{font-size:11.5px; color:var(--fg3); font-family:var(--mono);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>ffmpeg 批量压缩 · 统一入口</h1>
+    <div class="sub" id="cfgPath"></div>
+    <button class="ghost mini" id="btnService" title="关闭本机压缩入口服务">关闭服务</button>
+  </header>
+
+  <div class="tip">
+    把<b>视频文件或文件夹</b>拖到 <b>ffmpeg批量压缩.bat</b> 图标上即可加入下面的列表；
+    页面内也可以手动粘贴路径。源文件永远不会被改动。
+  </div>
+
+  <!-- 1. 路径 -->
+  <section>
+    <h2>1 · 待处理路径 <span class="hint" id="pathCount"></span></h2>
+    <ul class="paths" id="paths"></ul>
+    <div class="grid" style="margin-top:10px;">
+      <textarea id="addPaths" placeholder="手动添加：每行一个路径（也可用 ; 分隔），支持视频文件或文件夹&#10;例如 D:\videos\某目录  或  D:\a.mp4"></textarea>
+      <div class="row">
+        <button id="btnAdd">添加到列表</button>
+        <button class="ghost" id="btnClear">清空列表</button>
+        <span class="tagline">文件夹会递归处理其中的所有视频</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. 档位 -->
+  <section>
+    <h2>2 · 编码格式（档位）</h2>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <!-- 3. 常用参数 -->
+  <section>
+    <h2>3 · 常用参数</h2>
+    <div class="row" style="gap:18px;">
+      <div class="fld">
+        <label>画质（越小越清晰、体积越大）<span class="tagline" id="qVal"></span></label>
+        <input type="range" id="quality" min="0" max="51" step="1">
+      </div>
+      <div class="fld">
+        <label>速度 preset</label>
+        <select id="preset"></select>
+      </div>
+      <div class="fld">
+        <label>分辨率上限（长边）</label>
+        <select id="resSel">
+          <option value="0">保持源分辨率（不缩放）</option>
+          <option value="1920">1920（1080p）</option>
+          <option value="2560">2560（1440p）</option>
+          <option value="3840">3840（2160p）</option>
+          <option value="-1">自定义…</option>
+        </select>
+      </div>
+      <div class="fld" id="resCustomWrap" style="display:none;">
+        <label>自定义长边像素</label>
+        <input type="number" id="resCustom" min="0" step="2" value="0">
+      </div>
+      <div class="fld">
+        <label>帧率上限</label>
+        <select id="fpsSel">
+          <option value="0">保持源帧率</option>
+          <option value="24">24</option>
+          <option value="30">30</option>
+          <option value="60">60</option>
+          <option value="-1">自定义…</option>
+        </select>
+      </div>
+      <div class="fld" id="fpsCustomWrap" style="display:none;">
+        <label>自定义帧率</label>
+        <input type="number" id="fpsCustom" min="0" step="1" value="0">
+      </div>
+      <div class="fld">
+        <label>音频</label>
+        <select id="audioSel">
+          <option value="copy">保持原音频（直接复制）</option>
+          <option value="aac">转 AAC（体积更小）</option>
+        </select>
+      </div>
+      <div class="fld" id="audioBrWrap" style="display:none;">
+        <label>AAC 码率</label>
+        <select id="audioBr">
+          <option value="128k">128k</option>
+          <option value="160k" selected>160k</option>
+          <option value="192k">192k</option>
+          <option value="256k">256k</option>
+        </select>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. 预设 -->
+  <section>
+    <h2>4 · 预设 <span class="hint">选好预设会覆盖上面的参数</span></h2>
+    <div class="row">
+      <select id="presetList" style="min-width:260px;"></select>
+      <button id="btnApplyPreset">应用预设</button>
+      <button id="btnPick">从文件加载…（对话选择）</button>
+      <input type="text" id="presetPath" placeholder="或手动填写预设/配置路径，如 D:\我的_config.json">
+      <button class="ghost" id="btnLoadPath">按路径加载</button>
+    </div>
+    <div class="msg" id="presetMsg"></div>
+  </section>
+
+  <!-- 5. 开始 -->
+  <section>
+    <h2>5 · 开始压缩</h2>
+    <div class="row">
+      <button class="primary" id="btnStart">开始压缩</button>
+      <button class="danger" id="btnCancel" disabled>取消任务</button>
+      <button id="btnReport" disabled>打开报告</button>
+      <button id="btnReview" disabled>打开审阅</button>
+      <span class="msg" id="runMsg" style="margin:0;"></span>
+    </div>
+    <div style="margin-top:12px;">
+      <div class="bar"><i id="bar"></i></div>
+      <div class="pgline" id="pgline">尚未开始。</div>
+    </div>
+    <div class="log" id="log"></div>
+  </section>
+
+  <!-- 专业参数 -->
+  <details>
+    <summary>专业参数（默认隐藏，一般不用改）</summary>
+    <div class="inner grid" style="gap:12px;">
+      <div class="fld">
+        <label>原始 vparams（JSON 数组，改了即整体覆盖；留空=按上面的画质/速度自动改写）</label>
+        <textarea id="vparams" placeholder='例如 ["-preset","p5","-tune","hq","-rc","vbr","-cq","28","-b:v","0"]'></textarea>
+      </div>
+      <div class="row" style="gap:14px;">
+        <div class="fld"><label>容器</label><input type="text" id="container" value="mp4"></div>
+        <div class="fld"><label>像素格式</label><input type="text" id="pixfmt" value="yuv420p"></div>
+        <div class="fld"><label>输出后缀 tag</label><input type="text" id="tag" placeholder="留空=用档位默认"></div>
+        <div class="fld"><label>画质度量取样秒</label><input type="number" id="qseg" min="1" value="30"></div>
+      </div>
+      <div class="row" style="gap:16px;">
+        <label class="chk"><input type="checkbox" id="fForce"> 强制重编（忽略“已存在”）</label>
+        <label class="chk"><input type="checkbox" id="fFilter"> 忽略审阅筛选（含被过滤的文件）</label>
+        <label class="chk"><input type="checkbox" id="fNogpu"> 禁用 GPU 加速</label>
+        <label class="chk"><input type="checkbox" id="fQuality"> 计算画质指标（SSIM/PSNR，较慢）</label>
+      </div>
+      <div class="row">
+        <input type="text" id="savePath" placeholder="另存为预设的路径，如 D:\我的预设_config.json">
+        <button class="ghost" id="btnSavePreset">另存为预设</button>
+      </div>
+    </div>
+  </details>
+
+</div>
+
+<script>
+"use strict";
+var S = {profiles:[], presets:[], paths:[], config_path:"", default_profile:"", resolution:{}};
+var cur = {profile:"", quality:28, preset:"p5"};
+var lastSeq = 0, lastJobId = "", polling = false, running = false, timer = null;
+
+/* ---------------- 小工具 ---------------- */
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, function(c){
+  return ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"})[c]; }); }
+async function api(path, body, method){
+  var opt = {method: method || (body ? "POST" : "GET")};
+  if (body){ opt.headers = {"Content-Type":"application/json"}; opt.body = JSON.stringify(body); }
+  var r = await fetch(path, opt);
+  var j = null;
+  try { j = await r.json(); } catch(e){ j = {}; }
+  if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+  return j;
+}
+function say(el, text, cls){ el.className = "msg" + (cls ? " " + cls : ""); el.textContent = text || ""; }
+function logLine(ev){
+  var d = document.createElement("div");
+  d.className = ev.kind || "";
+  d.textContent = "[" + ev.at.slice(11) + "] " + ev.text;
+  var box = $("log");
+  var atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.appendChild(d);
+  while (box.childNodes.length > 600) box.removeChild(box.firstChild);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+/* ---------------- 渲染 ---------------- */
+function profileOf(name){
+  for (var i=0;i<S.profiles.length;i++) if (S.profiles[i].name === name) return S.profiles[i];
+  return S.profiles[0] || null;
+}
+function vparamsNum(p, keys){
+  var vp = (p && p.vparams) || [];
+  for (var i=0;i<vp.length;i++) if (keys.indexOf(vp[i]) >= 0 && i+1 < vp.length) return parseInt(vp[i+1],10);
+  return null;
+}
+function vparamsStr(p, key){
+  var vp = (p && p.vparams) || [];
+  for (var i=0;i<vp.length;i++) if (vp[i] === key && i+1 < vp.length) return String(vp[i+1]);
+  return null;
+}
+function presetOptionsFor(p){
+  var enc = (p && p.encoder) || "";
+  if (/(_nvenc)$/.test(enc)) return ["p1","p2","p3","p4","p5","p6","p7"];
+  return ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"];
+}
+
+function renderCards(){
+  var box = $("cards");
+  box.innerHTML = "";
+  S.profiles.forEach(function(p){
+    var d = document.createElement("div");
+    d.className = "card" + (p.name === cur.profile ? " on" : "");
+    d.innerHTML = '<div class="t">' + esc(p.name) + '</div>'
+                + '<div class="d">' + esc(p.description || "") + '</div>'
+                + '<div class="enc">' + esc(p.encoder || "") + ' · 后缀 _' + esc(p.tag || "") + '</div>';
+    d.onclick = function(){ selectProfile(p.name); };
+    box.appendChild(d);
+  });
+}
+function selectProfile(name){
+  cur.profile = name;
+  var p = profileOf(name);
+  var q = vparamsNum(p, ["-cq","-crf","-qp"]);
+  if (q !== null && !isNaN(q)){ cur.quality = q; $("quality").value = q; }
+  var ps = vparamsStr(p, "-preset");
+  if (ps) cur.preset = ps;
+  var sel = $("preset");
+  sel.innerHTML = "";
+  presetOptionsFor(p).forEach(function(o){
+    var op = document.createElement("option"); op.value = o; op.textContent = o;
+    if (o === cur.preset) op.selected = true;
+    sel.appendChild(op);
+  });
+  if (!ps){ sel.value = presetOptionsFor(p)[4] || sel.options[0].value; cur.preset = sel.value; }
+  $("qVal").textContent = "（当前 " + cur.quality + "）";
+  renderCards();
+}
+function renderPaths(){
+  var ul = $("paths");
+  ul.innerHTML = "";
+  if (!S.paths.length){
+    var li = document.createElement("li");
+    li.innerHTML = '<span class="empty">（空）请把视频/文件夹拖到 ffmpeg批量压缩.bat 上，或手动添加路径</span>';
+    ul.appendChild(li);
+  } else {
+    S.paths.forEach(function(p){
+      var li = document.createElement("li");
+      li.innerHTML = '<span class="p" title="' + esc(p) + '">' + esc(p) + '</span>';
+      var b = document.createElement("button");
+      b.className = "ghost mini"; b.textContent = "移除";
+      b.onclick = function(){ api("/api/remove_path", {path:p}).then(function(r){ S.paths = r.paths; renderPaths(); })["catch"](function(e){ say($("runMsg"), e.message, "err"); }); };
+      li.appendChild(b);
+      ul.appendChild(li);
+    });
+  }
+  $("pathCount").textContent = S.paths.length ? ("共 " + S.paths.length + " 项") : "";
+  $("btnReview").disabled = !(S.paths.length || lastJobId);
+}
+function renderPresets(){
+  var sel = $("presetList");
+  sel.innerHTML = '<option value="-1">（不套用预设，使用上面的参数）</option>';
+  S.presets.forEach(function(p, i){
+    var op = document.createElement("option");
+    op.value = String(i);
+    op.textContent = p.name + (p.from_file ? "（来自文件）" : "") + " — " + (p.description || p.base_profile);
+    sel.appendChild(op);
+  });
+}
+function renderState(){
+  $("cfgPath").textContent = "配置基底: " + (S.config_path || "—");
+  renderCards(); renderPaths(); renderPresets();
+}
+/* 服务端切换了配置基底后：整份状态换新，并重新选一次档位 */
+function applyStateFromServer(state){
+  S = Object.assign(S, state);
+  S.presets = state.presets || S.presets || [];
+  S.paths = state.paths || [];
+  if (S.profiles.length){
+    var d = S.default_profile || S.profiles[0].name;
+    selectProfile(profileOf(d) ? d : S.profiles[0].name);
+  }
+  renderState();
+}
+
+/* ---------------- 预设应用 ---------------- */
+function applyPreset(p, quiet){
+  if (!p) return;
+  if (p.base_profile && p.base_profile !== cur.profile) selectProfile(p.base_profile);
+  if (p.quality !== null && p.quality !== undefined){ cur.quality = p.quality; $("quality").value = p.quality; }
+  if (p.preset){ cur.preset = p.preset; var sel=$("preset"); sel.value = p.preset; }
+  if (p.resolution && p.resolution.max_long_side !== undefined){
+    var v = String(p.resolution.max_long_side || 0);
+    var sel2 = $("resSel");
+    if ([0,1920,2560,3840].indexOf(parseInt(v,10)) >= 0){ sel2.value = v; $("resCustomWrap").style.display = "none"; }
+    else { sel2.value = "-1"; $("resCustom").value = v; $("resCustomWrap").style.display = ""; }
+  }
+  if (p.resolution && p.resolution.max_fps !== undefined){
+    var f = String(p.resolution.max_fps || 0);
+    var sel3 = $("fpsSel");
+    if ([0,24,30,60].indexOf(parseInt(f,10)) >= 0){ sel3.value = f; $("fpsCustomWrap").style.display = "none"; }
+    else { sel3.value = "-1"; $("fpsCustom").value = f; $("fpsCustomWrap").style.display = ""; }
+  }
+  if (p.audio_mode){ $("audioSel").value = p.audio_mode === "copy" ? "copy" : "aac"; }
+  if (p.audio_mode && p.audio_mode !== "copy" && p.audio_bitrate){ $("audioBr").value = p.audio_bitrate; }
+  $("audioBrWrap").style.display = ($("audioSel").value === "aac") ? "" : "none";
+  if (p.tag) $("tag").value = p.tag;
+  if (p.container) $("container").value = p.container;
+  if (p.pix_fmt) $("pixfmt").value = p.pix_fmt;
+  if (p.vparams) $("vparams").value = JSON.stringify(p.vparams);
+  var f2 = p.flags || {};
+  $("fForce").checked = !!f2.force; $("fFilter").checked = !!f2.include_filtered;
+  $("fNogpu").checked = !!f2.no_gpu; $("fQuality").checked = !!f2.quality_metrics;
+  if (f2.quality_seg) $("qseg").value = f2.quality_seg;
+  $("qVal").textContent = "（当前 " + cur.quality + "）";
+  if (!quiet) say($("presetMsg"), "已应用预设：" + p.name, "ok");
+}
+
+/* ---------------- 请求体 ---------------- */
+function collect(){
+  var resSel = $("resSel").value, fpsSel = $("fpsSel").value;
+  var mls = resSel === "-1" ? parseInt($("resCustom").value || 0, 10) : parseInt(resSel, 10);
+  var mf  = fpsSel === "-1" ? parseInt($("fpsCustom").value || 0, 10) : parseInt(fpsSel, 10);
+  if (isNaN(mls)) mls = 0;
+  if (isNaN(mf)) mf = 0;
+  var vpTxt = $("vparams").value.trim();
+  var vp = null;
+  if (vpTxt){
+    try { vp = JSON.parse(vpTxt); } catch(e){ throw new Error("vparams 不是合法 JSON 数组"); }
+    if (!Array.isArray(vp)) throw new Error("vparams 必须是 JSON 数组");
+  }
+  var audioMode = $("audioSel").value;
+  var opts = {
+    quality: parseInt($("quality").value, 10),
+    preset: $("preset").value,
+    vparams: vp,
+    container: $("container").value.trim() || "mp4",
+    pix_fmt: $("pixfmt").value.trim() || "yuv420p",
+    tag: $("tag").value.trim() || null,
+    audio_mode: audioMode,
+    audio_bitrate: audioMode === "aac" ? $("audioBr").value : null
+  };
+  return {
+    profile: cur.profile,
+    options: opts,
+    resolution: {max_long_side: mls, max_fps: mf},
+    flags: {force:$("fForce").checked, include_filtered:$("fFilter").checked,
+            no_gpu:$("fNogpu").checked, quality_metrics:$("fQuality").checked,
+            quality_seg: parseInt($("qseg").value || 30, 10)},
+    paths: S.paths.slice()
+  };
+}
+
+/* ---------------- 轮询 ---------------- */
+function setRunning(r){
+  running = r;
+  $("btnStart").disabled = r;
+  $("btnCancel").disabled = !r;
+  $("btnAdd").disabled = false;
+}
+function renderJob(job, result){
+  var pct = job.percent || 0;
+  if (!running && job.elapsed && result && result.exit !== null && result.exit !== undefined && pct < 100) pct = 100;
+  $("bar").style.width = Math.max(0, Math.min(100, pct)) + "%";
+  if (!job.id){ $("pgline").textContent = "尚未开始。"; return; }
+  var seg = "第 " + (job.index || 0) + "/" + (job.total || job.count || 0) + " 个";
+  if (job.current) seg += "　" + job.current;
+  $("pgline").innerHTML = esc(seg) + "　<b>" + pct.toFixed(1) + "%</b>　用时 " + (job.elapsed || 0) + "s";
+  $("btnReport").disabled = !(result && result.report);
+  $("btnReview").disabled = !(S.paths.length || lastJobId);
+}
+function schedule(){
+  clearTimeout(timer);
+  if (document.hidden){ timer = setTimeout(schedule, 1500); return; }
+  timer = setTimeout(poll, 600);
+}
+async function poll(){
+  try {
+    var r = await api("/api/status?since=" + lastSeq + "&job=" + encodeURIComponent(lastJobId));
+    if (r.reset){ $("log").innerHTML = ""; lastSeq = 0; }   // 换任务/游标失效：清空日志再重放
+    (r.events || []).forEach(function(ev){ logLine(ev); lastSeq = Math.max(lastSeq, ev.i); });
+    if (r.job && typeof r.job.id === "string") lastJobId = r.job.id;
+    if (r.paths){
+      var changed = (r.paths.length !== S.paths.length);
+      if (!changed){ for (var i=0;i<r.paths.length;i++){ if (r.paths[i] !== S.paths[i]){ changed = true; break; } } }
+      if (changed){ S.paths = r.paths; renderPaths(); }
+    }
+    setRunning(!!r.running);
+    renderJob(r.job || {}, r.result || {});
+    if (!r.running && r.result && r.result.exit !== null && r.result.exit !== undefined){
+      var e = r.result.exit;
+      say($("runMsg"), e === 0 ? "全部完成。" : (e === 130 ? "任务已被取消。" : "任务结束，退出码 " + e + "（可能有未成功的文件，详见日志）"),
+          e === 0 ? "ok" : (e === 130 ? "" : "err"));
+    }
+  } catch(err){ /* 服务关闭时不刷错 */ }
+  schedule();
+}
+
+/* ---------------- 事件绑定 ---------------- */
+function bindUI(){
+  $("quality").oninput = function(){ cur.quality = parseInt(this.value, 10); $("qVal").textContent = "（当前 " + cur.quality + "）"; };
+  $("preset").onchange = function(){ cur.preset = this.value; };
+  $("resSel").onchange = function(){ $("resCustomWrap").style.display = (this.value === "-1") ? "" : "none"; };
+  $("fpsSel").onchange = function(){ $("fpsCustomWrap").style.display = (this.value === "-1") ? "" : "none"; };
+  $("audioSel").onchange = function(){ $("audioBrWrap").style.display = (this.value === "aac") ? "" : "none"; };
+
+  $("btnAdd").onclick = function(){
+    var txt = $("addPaths").value;
+    var parts = txt.split(/[\n;]+/).map(function(s){ return s.trim().replace(/^"|"$/g, ""); }).filter(Boolean);
+    if (!parts.length){ say($("runMsg"), "请先填写要添加的路径", "err"); return; }
+    api("/api/add_paths", {paths:parts}).then(function(r){
+      S.paths = r.paths; renderPaths(); $("addPaths").value = "";
+      say($("runMsg"), "已添加 " + (r.added || []).length + " 项" + ((r.rejected||[]).length ? ("，忽略 " + r.rejected.length + " 个不存在的路径") : ""),
+          (r.rejected||[]).length ? "err" : "ok");
+    })["catch"](function(e){ say($("runMsg"), e.message, "err"); });
+  };
+  $("btnClear").onclick = function(){
+    api("/api/clear_paths", {}).then(function(r){ S.paths = r.paths; renderPaths(); })
+      ["catch"](function(e){ say($("runMsg"), e.message, "err"); });
+  };
+  $("btnApplyPreset").onclick = function(){
+    var i = parseInt($("presetList").value, 10);
+    if (i < 0){ say($("presetMsg"), "当前未选择预设。", ""); return; }
+    applyPreset(S.presets[i], false);
+  };
+  $("btnPick").onclick = function(){
+    say($("presetMsg"), "已弹出系统文件对话框，请选择 *_config.json…", "");
+    api("/api/pick_preset", {}).then(function(r){
+      if (r.cancelled){ say($("presetMsg"), "已取消选择。", ""); return; }
+      if (r.kind === "config"){
+        applyStateFromServer(r.state);
+        say($("presetMsg"), "已切换配置基底：" + r.path, "ok");
+      } else {
+        S.presets = (S.presets.filter(function(p){ return !p.from_file; })).concat(r.presets);
+        renderPresets();
+        say($("presetMsg"), "已加载 " + r.presets.length + " 条预设：" + r.path, "ok");
+      }
+      $("presetPath").value = r.path;
+    })["catch"](function(e){ say($("presetMsg"), e.message, "err"); });
+  };
+  $("btnLoadPath").onclick = function(){
+    var p = $("presetPath").value.trim();
+    if (!p){ say($("presetMsg"), "请填写预设/配置路径", "err"); return; }
+    api("/api/preset?path=" + encodeURIComponent(p)).then(function(r){
+      if (r.kind === "config"){
+        applyStateFromServer(r.state);
+        say($("presetMsg"), "已切换配置基底：" + r.path, "ok");
+      } else {
+        S.presets = (S.presets.filter(function(x){ return !x.from_file; })).concat(r.presets);
+        renderPresets();
+        say($("presetMsg"), "已加载 " + r.presets.length + " 条预设：" + r.path, "ok");
+      }
+    })["catch"](function(e){ say($("presetMsg"), e.message, "err"); });
+  };
+  $("btnSavePreset").onclick = function(){
+    var p = $("savePath").value.trim();
+    if (!p){ say($("presetMsg"), "请填写另存路径", "err"); return; }
+    var req, preset;
+    try { req = collect(); } catch(e){ say($("presetMsg"), e.message, "err"); return; }
+    preset = {name:p.replace(/^.*[\\\/]/, "").replace(/\.json$/i, ""),
+              description:"由统一入口导出", base_profile:req.profile,
+              quality:req.options.quality, preset:req.options.preset,
+              tag:req.options.tag, container:req.options.container, pix_fmt:req.options.pix_fmt,
+              audio_mode:req.options.audio_mode, audio_bitrate:req.options.audio_bitrate,
+              resolution:req.resolution, flags:req.flags};
+    api("/api/save_preset", {path:p, preset:preset}).then(function(r){
+      say($("presetMsg"), "已保存: " + r.path, "ok");
+    })["catch"](function(e){ say($("presetMsg"), e.message, "err"); });
+  };
+
+  $("btnStart").onclick = function(){
+    var req;
+    try { req = collect(); } catch(e){ say($("runMsg"), e.message, "err"); return; }
+    if (!req.paths.length){ say($("runMsg"), "请先加入至少一个路径（拖到 .bat 上或手动添加）", "err"); return; }
+    if ($("vparams").value.trim() === "") $("vparams").value = "";
+    say($("runMsg"), "正在启动…", "");
+    api("/api/start", req).then(function(r){
+      say($("runMsg"), "任务已启动：" + r.job_id, "ok");
+      setRunning(true);
+    })["catch"](function(e){ say($("runMsg"), e.message, "err"); });
+  };
+  $("btnCancel").onclick = function(){
+    api("/api/cancel", {}).then(function(r){ say($("runMsg"), r.message || "已取消", ""); })
+      ["catch"](function(e){ say($("runMsg"), e.message, "err"); });
+  };
+  $("btnReport").onclick = function(){ api("/api/open_report", {}).then(function(){})["catch"](function(e){ say($("runMsg"), e.message, "err"); }); };
+  $("btnReview").onclick = function(){
+    api("/api/open_review", {}).then(function(){ say($("runMsg"), "已打开审阅入口（若首次打开稍等片刻）", "ok"); })
+      ["catch"](function(e){ say($("runMsg"), e.message, "err"); });
+  };
+  $("btnService").onclick = function(){
+    if (!confirm("确定要关闭本机压缩入口服务吗？（正在运行的任务会被取消）")) return;
+    api("/api/shutdown", {}).then(function(){
+      document.body.innerHTML = '<div style="padding:40px;font-family:sans-serif;color:#9aa4ad">'
+        + '压缩入口服务已关闭，可以关闭本页面。需要时再双击 ffmpeg批量压缩.bat。</div>';
+    })["catch"](function(){});
+  };
+}
+
+/* ---------------- 启动 ---------------- */
+async function boot(){
+  try {
+    var st = await api("/api/state");
+    S = Object.assign(S, st);
+    bindUI();
+    if (!S.profiles.length){ say($("runMsg"), "配置里没有可用的 profiles，请检查 config.json", "err"); return; }
+    var def = S.default_profile || S.profiles[0].name;
+    selectProfile(def);
+    renderState();
+    if (S.resolution && S.resolution.max_long_side !== undefined){
+      var v = String(S.resolution.max_long_side || 0);
+      if ([0,1920,2560,3840].indexOf(parseInt(v,10)) >= 0) $("resSel").value = v;
+      else { $("resSel").value = "-1"; $("resCustom").value = v; $("resCustomWrap").style.display = ""; }
+      if (S.resolution.max_fps) $("fpsSel").value = String(S.resolution.max_fps);
+    }
+    if (!S.paths.length) setRunning(false);
+    poll();
+  } catch(e){
+    say($("runMsg"), "无法连接服务: " + e.message, "err");
+  }
+}
+boot();
+</script>
+</body>
+</html>
