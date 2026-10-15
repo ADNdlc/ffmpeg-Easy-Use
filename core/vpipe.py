@@ -232,7 +232,11 @@ def load_config(path):
     if not isinstance(cfg, dict):
         die("配置文件内容必须是 JSON 对象: " + path)
     if not isinstance(cfg.get('work_dir'), str) or not cfg.get('work_dir'):
-        die("配置缺少必需的 work_dir（字符串）: " + path)
+        # 仓库自带的 config.json 里路径字段留空、由安装器写入。未安装就直接运行（例如
+        # 刚克隆完就双击入口）时，工作目录默认落到程序目录旁的 _work——与安装器写入的
+        # 位置一致，避免仅因为没装过就报错退出。
+        cfg['work_dir'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_work')
+        log("提示: config.json 未设置 work_dir，本次使用 " + cfg['work_dir'])
     if not isinstance(cfg.get('profiles'), dict) or not cfg.get('profiles'):
         die("配置缺少必需的 profiles（非空对象）: " + path)
     return cfg
