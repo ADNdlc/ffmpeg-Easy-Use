@@ -18,7 +18,8 @@ compress_gui.py —— vpipe 统一压缩入口（本地单页 GUI）
 
 用法
   python compress_gui.py                  # 启动并打开页面（已有实例则复用）
-  python compress_gui.py --open <路径...>  # 启动/复用并把路径加入列表，然后打开页面（.bat 用这个）
+  python compress_gui.py --open <路径...>  # 启动（或复用已运行实例）并把路径加入列表；.bat 用这个。
+                                          # 首次启动会打开页面；已运行时只追加列表，页面自动刷新，不再新开
   python compress_gui.py --no-browser     # 只起服务
   python compress_gui.py --port 0         # 固定端口（0=自动）
   python compress_gui.py --stop           # 关闭已运行实例
@@ -1058,9 +1059,15 @@ def _run(args):
         url = 'http://127.0.0.1:%d/' % existed
         vpipe.log("压缩入口已在运行，直接复用: " + url)
         if args.paths:
+            # 拖入路径时只把路径追加进待处理列表：任务本来就是串行的，既没必要并行，
+            # 也不必再开一个页面——已在运行的页面每 0.6 秒拉一次 /api/status，
+            # 列表变化会自动刷新出来。
             r = _post_json(existed, '/api/add_paths', {'paths': args.paths})
-            vpipe.log("已加入 %d 个路径（被拒 %d 个）"
-                      % (len(r.get('added') or []), len(r.get('rejected') or [])))
+            for p in (r.get('added') or []):
+                vpipe.log("  已加入待处理列表: " + p)
+            for b in (r.get('rejected') or []):
+                vpipe.log("  [忽略] 路径不存在: " + b)
+            return EXIT_OK
         if not args.no_browser:
             webbrowser.open(url)
         return EXIT_OK
