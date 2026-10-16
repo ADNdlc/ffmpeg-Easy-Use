@@ -29,7 +29,7 @@ vpipe —— 本地视频批量压缩管线（scan / plan / encode / report / co
 
 退出码：0=全部成功；1=存在失败项；2=参数/配置错误；130=用户中断
 
-依赖：ffmpeg.exe / ffprobe.exe（路径由 config.json 的 ffmpeg_dir 指定，一键安装器会自动写入）
+依赖：ffmpeg.exe / ffprobe.exe（路径由 config.json 的 ffmpeg_dir 指定，初始化脚本会自动写入）
 """
 import argparse
 import csv
@@ -219,7 +219,15 @@ def _remove_quiet(path):
 
 def load_config(path):
     if not os.path.isfile(path):
-        die("找不到配置文件: " + path)
+        # 仓库里放的是 config.example.json，初始化脚本据此就地生成 config.json（后者被
+        # .gitignore 忽略）。若还没初始化就直接运行，这里回退读同目录的 config.example.json，
+        # 保证 clone 完即可运行（ffmpeg 走 <仓库>\bin 或 PATH）。
+        alt = os.path.join(os.path.dirname(path), 'config.example.json')
+        if os.path.basename(path) == 'config.json' and os.path.isfile(alt):
+            log("提示: 未找到 config.json（尚未初始化？），本次使用 config.example.json")
+            path = alt
+        else:
+            die("找不到配置文件: " + path)
     try:
         with open(path, 'r', encoding='utf-8-sig') as f:   # utf-8-sig 兼容记事本 BOM
             cfg = json.load(f)
@@ -232,9 +240,8 @@ def load_config(path):
     if not isinstance(cfg, dict):
         die("配置文件内容必须是 JSON 对象: " + path)
     if not isinstance(cfg.get('work_dir'), str) or not cfg.get('work_dir'):
-        # 仓库自带的 config.json 里路径字段留空、由安装器写入。未安装就直接运行（例如
-        # 刚克隆完就双击入口）时，工作目录默认落到程序目录旁的 _work——与安装器写入的
-        # 位置一致，避免仅因为没装过就报错退出。
+        # 路径字段留空、由初始化脚本写入。未初始化就直接运行（例如刚克隆完就双击入口）时，
+        # 工作目录默认落到 core\_work——与初始化写入的位置一致，避免仅因为没初始化就报错退出。
         cfg['work_dir'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_work')
         log("提示: config.json 未设置 work_dir，本次使用 " + cfg['work_dir'])
     if not isinstance(cfg.get('profiles'), dict) or not cfg.get('profiles'):
@@ -257,7 +264,7 @@ def pick_profile(cfg, name):
 def tools_from_cfg(cfg):
     d = cfg.get('ffmpeg_dir')
     if not d:
-        # 未显式配置时：优先用 <安装目录>\bin（与本机结构一致），再回退到 PATH 里的 ffmpeg
+        # 未显式配置时：优先用 <仓库>\bin（与本机结构一致），再回退到 PATH 里的 ffmpeg
         sibling = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bin')
         if os.path.isfile(os.path.join(sibling, 'ffmpeg.exe')):
             d = sibling

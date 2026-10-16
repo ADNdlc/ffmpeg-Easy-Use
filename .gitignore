@@ -2,6 +2,12 @@
 _work/
 .data/
 
+# 初始化时就地生成的用户配置（模板见 core/config.example.json）
+core/config.json
+
+# 自动下载到仓库内的 ffmpeg
+bin/
+
 # Python 缓存
 __pycache__/
 *.pyc

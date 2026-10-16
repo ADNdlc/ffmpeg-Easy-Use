@@ -1,49 +1,39 @@
 ﻿#Requires -Version 5.1
 <#
-  ffmpeg-Easy-Use —— 一键安装脚本（Windows PowerShell 5.1+）
+  ffmpeg-Easy-Use —— 初始化脚本（Windows PowerShell 5.1+）
+
+  仓库目录就是使用目录：把仓库放到合适位置后，双击「初始化.bat」（或运行本脚本），
+  脚本只负责检测/构建运行环境并就地生成配置文件，不会复制、不会移动任何程序文件。
 
   用法（默认，无需任何参数）:
     powershell -ExecutionPolicy Bypass -File install.ps1
-      先扫描机器上的 ffmpeg：扫到就装到它同级；没扫到就装到当前盘并询问是否自动下载
+      先扫描机器上的 ffmpeg：扫到就记下它所在目录直接复用；没扫到就询问是否下载到 <仓库>\bin
 
   可选参数:
-    -Target <目录>   指定“父目录”，在其中创建 FFmpeg\（内含 bin\ 与 script\）；
-                     若该目录本身已叫 FFmpeg，则直接采用它
-    -Root <目录>     直接指定安装根本身（高级用法；根内需能容纳 script\ 与 ffmpeg）
-    -Mode download   跳过询问，直接下载 essentials 版
+    -Mode download   未检测到 ffmpeg 时跳过询问，直接下载 essentials 版
     -NoDownload      即使没扫到 ffmpeg 也绝不下载（只用 -FfmpegZip 或手动放置）
     -FfmpegZip <x>   用本地 zip 文件或 http(s) URL 代替在线下载
-    -Force           所有交互询问一律确认（冲突自动备份；下载不再询问）
+    -Force           所有交互询问一律确认（下载不再询问）
     -DryRun          只预演，不修改任何文件
 
-  安装根解析优先级:
-    1) -Root 显式指定
-    2) -Target 指定的父目录 + \FFmpeg
-    3) 扫到 ffmpeg.exe -> 它所在目录的上一级（该层名为 bin 时即 <根>\bin）
-    4) 都没扫到 -> <默认父目录>\FFmpeg（默认 = 安装器所在盘的 \Tool）
+  ffmpeg 解析优先级:
+    1) <仓库>\bin 里已有 ffmpeg.exe + ffprobe.exe  -> 直接用（<仓库>\bin）
+    2) PATH 里检测到 ffmpeg.exe                    -> 记下它所在目录，直接复用、不下载、不复制
+    3) 都没有                                       -> 下载 essentials 到 <仓库>\bin（先询问）
 
-  两种 ffmpeg 场景:
-    · 没扫到：在 <根>\ 下创建 bin\（下载/解压得到 ffmpeg）与 script\（工具本体）
-    · 扫到了：不复制、不新建 bin\，而是在 <根>\bin 建“目录联接”指向你已有的 ffmpeg 目录
-
-  想固定装到某个目录（脚本更改方法）：改下面 $DefaultParentDir 的值即可。
+  初始化产物（全部落在仓库目录内）:
+    core\config.json   ← 由 core\config.example.json 就地生成；
+                          已存在则保留其中的档位/画质设置，只更新 ffmpeg 与工作目录
+    bin\               ← 仅在没有可用 ffmpeg 时产生（自动下载的 ffmpeg）
 #>
 param(
     [ValidateSet('auto', 'download')]
     [string]$Mode = 'auto',
-    [string]$Target = '',
-    [string]$Root = '',
     [switch]$NoDownload,
     [switch]$Force,
     [switch]$DryRun,
     [string]$FfmpegZip = ''
 )
-
-# ---------------- 想固定装到某个目录？改这里（脚本更改方法）----------------
-# 没扫到 ffmpeg 时，会在该目录下创建 FFmpeg\（内含 bin\ 与 script\）。
-# 留空 = 安装器所在盘的 \Tool，即 X:\Tool\FFmpeg；也可写成 'D:\MyTools' 之类。
-$DefaultParentDir = ''
-# -------------------------------------------------------------------------
 
 $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch { }  # Tls12
@@ -57,19 +47,12 @@ function Info($m) { Write-Host $m -ForegroundColor Cyan }
 function Good($m) { Write-Host $m -ForegroundColor Green }
 function Warn($m) { Write-Host $m -ForegroundColor Yellow }
 function Bad($m) { Write-Host $m -ForegroundColor Red }
-function Die($m) { Bad ''; Bad "[安装失败] $m"; exit 2 }
+function Die($m) { Bad ''; Bad "[初始化失败] $m"; exit 2 }
 function Yes($m) {
     if ($Force) { return $true }
     try { $a = Read-Host ("$m [Y/N]") } catch { return $false }
     return ($a -match '^(y|Y|是)')
 }
-
-function Norm([string]$p) {
-    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($p)
-    if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
-    return $full
-}
-function Same([string]$a, [string]$b) { return [string]::Equals($a, $b, [StringComparison]::OrdinalIgnoreCase) }
 
 function JsonStr([string]$s) { return '"' + $s.Replace('\', '\\').Replace('"', '\"') + '"' }
 
@@ -97,23 +80,6 @@ function Find-FfmpegDir {
         if ($w.Count -gt 0) { return (Split-Path -Parent $w[0].Trim()) }
     } catch { }
     return ''
-}
-
-function RootFromBinDir([string]$binDir) {
-    if (-not $binDir) { return '' }
-    if ((Split-Path -Leaf $binDir) -ieq 'bin') { return (Split-Path -Parent $binDir) }
-    return $binDir
-}
-
-# 在 <根>\bin 建一个“目录联接（junction）”指向已有的 ffmpeg 目录：
-# 这样不用复制一份 ffmpeg，布局仍然是统一的 <根>\bin（mklink /J 不需要管理员权限）。
-function New-BinLink([string]$linkPath, [string]$targetPath) {
-    try {
-        if (Test-Path -LiteralPath $linkPath) { return $false }
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $linkPath) | Out-Null
-        & cmd.exe /c mklink /J $linkPath $targetPath | Out-Null
-        return (Test-Path -LiteralPath (Join-Path $linkPath 'ffmpeg.exe'))
-    } catch { return $false }
 }
 
 # 目录里是否同时具备 ffmpeg.exe 与 ffprobe.exe
@@ -154,127 +120,54 @@ function Install-FromZip([string]$zip, [string]$destBin, [string]$tmpRoot) {
 # ------------------------------------------------------------------ 开始
 Info ''
 Info '============================================================'
-Info '  ffmpeg-Easy-Use · 一键安装'
+Info '  ffmpeg-Easy-Use · 初始化'
+Info '  仓库目录即使用目录：只检测/构建运行环境，不复制任何文件'
 Info '============================================================'
-Info ("模式: " + $(if ($Mode -eq 'auto') { '复用已安装的 ffmpeg（auto）' } else { '无 ffmpeg 时自动下载（download）' }))
+Info ("模式: " + $(if ($Mode -eq 'auto') { '复用已有 ffmpeg（auto）' } else { '无 ffmpeg 时直接下载（download）' }))
 Info ''
 
-$SrcRepo = Split-Path -Parent $PSScriptRoot
-if (-not (Test-Path -LiteralPath (Join-Path $SrcRepo 'core\vpipe.py'))) {
-    Die "未找到程序文件: $SrcRepo\core\vpipe.py（请确保 install\ 与 core\ 在同一仓库目录下）"
+$Repo = Split-Path -Parent $PSScriptRoot                        # install\ 的上一级 = 仓库根
+if (-not (Test-Path -LiteralPath (Join-Path $Repo 'core\vpipe.py'))) {
+    Die "未找到程序文件: $Repo\core\vpipe.py（请确保 install\ 与 core\ 在同一仓库目录下）"
 }
 
-# ---------- 1. 解析安装根 / ffmpeg 目录 ----------
+$CoreDir = Join-Path $Repo 'core'
+$BinDir = Join-Path $Repo 'bin'
+$ExampleCfg = Join-Path $CoreDir 'config.example.json'
+$CfgPath = Join-Path $CoreDir 'config.json'
+$WorkDir = Join-Path $CoreDir '_work'
+
+if (-not (Test-Path -LiteralPath $ExampleCfg)) { Die "缺少配置模板: $ExampleCfg" }
+Info "仓库目录 : $Repo"
+
+# ---------- 1. 解析 ffmpeg 目录 ----------
 $detected = Find-FfmpegDir
-if ($Root) { $Root = Norm $Root }
-
-if ($Root) {
-    Info "安装根（-Root 指定）: $Root"                      # 高级用法：直接给出安装根本身
-} elseif ($Target) {
-    $t = Norm $Target
-    $Root = if ((Split-Path -Leaf $t) -ieq 'FFmpeg') { $t } else { Join-Path $t 'FFmpeg' }
-    Info "安装根（-Target 指定）: $Root"
-} elseif ($detected) {
-    $Root = RootFromBinDir $detected
-    Good "检测到 ffmpeg: $detected"
-    Info "将安装到它的同级目录: $Root"
-} else {
-    $base = $DefaultParentDir
-    if (-not $base) { $base = (Split-Path -Qualifier $SrcRepo) + '\Tool' }   # 例如 "C:\Tool"
-    $Root = Norm (Join-Path $base 'FFmpeg')
-    Warn "未检测到 ffmpeg，默认安装到: $Root"
-}
-
-$ScriptDir = Join-Path $Root 'script'
-$BinDir = Join-Path $Root 'bin'
 $FfmpegDir = ''
-$linked = $false
 $needFfmpeg = $false
-
 if (Has-Tools $BinDir) {
-    $FfmpegDir = $BinDir                                    # 根内已有可用的 bin\
-} elseif (Has-Tools $Root) {
-    $FfmpegDir = $Root                                      # ffmpeg 直接放在根内
-} elseif ($Mode -eq 'download' -or $FfmpegZip) {
-    $FfmpegDir = $BinDir                                    # 你明确要求下载 / 指定了 zip：优先获取
-    $needFfmpeg = $true
+    $FfmpegDir = $BinDir                                        # 仓库内已有可用 bin\
+    Good "使用仓库内的 ffmpeg: $BinDir"
 } elseif (Has-Tools $detected) {
-    # 已有 ffmpeg：不复制、不新建 bin\，改为在 <根>\bin 建“联接”指向它
-    if (New-BinLink $BinDir $detected) {
-        $FfmpegDir = $BinDir
-        $linked = $true
-        Good "已在 $BinDir 建立联接 -> $detected（不复制、不额外占用空间）"
-    } else {
-        $FfmpegDir = $detected
-        Warn "无法建立 bin 联接，配置将直接指向: $detected"
-    }
+    $FfmpegDir = $detected                                      # 直接复用系统 ffmpeg
+    Good "检测到系统 ffmpeg: $detected（直接复用，不下载、不复制）"
 } else {
-    $FfmpegDir = $BinDir                                    # 没有可用 ffmpeg：需要在 bin\ 里获取
+    $FfmpegDir = $BinDir                                        # 没有可用 ffmpeg：需要在 bin\ 里获取
     $needFfmpeg = $true
+    Warn "未检测到可用的 ffmpeg（也可把 ffmpeg.exe / ffprobe.exe 手动放进 $BinDir）"
 }
 
 if ($DryRun) {
-    $exists = Test-Path -LiteralPath $ScriptDir
-    $ours = $exists -and (Test-Path -LiteralPath (Join-Path $ScriptDir 'core\vpipe.py'))
-    $ffDesc = if ($needFfmpeg) { '（需要获取：会先询问是否下载）' } elseif ($linked) { '（联接指向已有目录）' } else { '（已就绪）' }
-    $src = if ($FfmpegZip) { "指定来源: $FfmpegZip" } elseif ($needFfmpeg) { $ONLINE[0] } elseif ($linked) { "复用(联接) $detected" } else { $FfmpegDir }
+    $hasCfg = Test-Path -LiteralPath $CfgPath
     Info '------------------ 预演（不修改任何文件） ------------------'
-    Info "安装根   : $Root"
-    Info "工具目录 : $ScriptDir" + $(if (-not $exists) { '（新建）' } elseif ($ours) { '（已存在·本工具，将就地更新）' } else { '（已存在·非本工具，将需确认/备份）' })
-    Info "ffmpeg   : $FfmpegDir" + $ffDesc
-    Info "工作目录 : $ScriptDir\core\_work"
-    Info "来源     : $src"
+    Info "配置文件 : $CfgPath$(if ($hasCfg) { '（已存在，将保留档位/画质设置，仅更新路径）' } else { '（将由 config.example.json 生成）' })"
+    Info "ffmpeg   : $(if ($needFfmpeg) { "$BinDir（需要获取：会先询问是否下载）" } else { $FfmpegDir })"
+    Info "工作目录 : $WorkDir"
+    Info "来源     : $(if ($FfmpegZip) { "指定来源: $FfmpegZip" } elseif ($needFfmpeg) { $ONLINE[0] } else { '复用已有 ffmpeg' })"
     Info '----------------------------------------------------------'
     exit 0
 }
 
-# ---------- 2. 先读取既有 config.json（保留用户设置） ----------
-$tplCfg = Join-Path $SrcRepo 'core\config.json'
-$cfgPath = Join-Path $ScriptDir 'core\config.json'
-$tplText = Get-Content -LiteralPath $tplCfg -Raw -Encoding UTF8
-$cfgText = ''
-if (Test-Path -LiteralPath $cfgPath) {
-    try {
-        $raw = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8
-        $null = $raw | ConvertFrom-Json
-        $cfgText = $raw
-        Info '已存在 config.json：保留其中的档位/画质等设置，仅更新 ffmpeg 与工作目录'
-    } catch {
-        $bak = $cfgPath + '.bad-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-        Move-Item -LiteralPath $cfgPath -Destination $bak -Force
-        Warn "原 config.json 无法解析，已备份为: $bak"
-    }
-}
-if (-not $cfgText) {
-    $cfgText = $tplText
-    Info '使用仓库自带的基础 config.json 作为模板'
-}
-if ($cfgText -notmatch '"profiles"') {
-    Die "基础 config.json 无效（缺少 profiles 段）: $tplCfg"
-}
-
-# ---------- 3. 命名冲突处理 ----------
-if (Test-Path -LiteralPath $ScriptDir) {
-    $isDir = Test-Path -LiteralPath $ScriptDir -PathType Container
-    $isOurs = $isDir -and (Test-Path -LiteralPath (Join-Path $ScriptDir 'core\vpipe.py'))
-    if (-not $isDir) {
-        Warn "目标已存在同名文件（非目录）: $ScriptDir"
-        if (-not (Yes '是否将其改名备份后继续？')) { Die "已取消（可用 -Force 自动备份，或改用 -Root 换一个安装根）" }
-        $bk = "$ScriptDir.conflict-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
-        Move-Item -LiteralPath $ScriptDir -Destination $bk -Force
-        Warn "已备份为: $bk"
-    } elseif (-not $isOurs) {
-        Warn "目标已存在 script\ 目录，但它不是本工具: $ScriptDir"
-        if (-not (Yes '是否把它改名备份后继续安装？')) { Die "已取消（可用 -Force 自动备份，或改用 -Root 换一个安装根）" }
-        $bk = Join-Path $Root ('script_backup_' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-        Move-Item -LiteralPath $ScriptDir -Destination $bk -Force
-        Warn "已备份为: $bk"
-    } else {
-        Info "检测到已安装的本工具，执行就地更新（不会删除你的其他文件）"
-    }
-}
-
-# ---------- 4. 获取 ffmpeg（如需要） ----------
+# ---------- 2. 获取 ffmpeg（如需要） ----------
 if ($needFfmpeg) {
     if ($NoDownload -and -not $FfmpegZip) {
         Die "未检测到可用的 ffmpeg，且已指定 -NoDownload。请把手动准备好的 ffmpeg.exe / ffprobe.exe 放到 $BinDir 后重试。"
@@ -324,40 +217,41 @@ if (-not (Test-Path -LiteralPath (Join-Path $FfmpegDir 'ffmpeg.exe'))) { Die "�
 if (-not (Test-Path -LiteralPath (Join-Path $FfmpegDir 'ffprobe.exe'))) { Die "缺少 ffprobe.exe: $FfmpegDir" }
 Good "ffmpeg 就绪: $FfmpegDir"
 
-# ---------- 5. 复制程序到 <根>\script ----------
-if (Same $SrcRepo $ScriptDir) {
-    Info '安装器已在目标位置运行，跳过文件复制'
-} else {
-    Info "复制程序到 $ScriptDir"
-    New-Item -ItemType Directory -Force -Path $ScriptDir | Out-Null
-    $skip = @('.git', '.gitignore', '_work', '__pycache__', '_dl_tmp', '_out', '.vs', '.vscode')
-    $items = @(Get-ChildItem -LiteralPath $SrcRepo -Force | Where-Object { ($skip -notcontains $_.Name) -and ($_.Name -notlike '*.pyc') })
-    foreach ($it in $items) {
-        Copy-Item -LiteralPath $it.FullName -Destination $ScriptDir -Recurse -Force
+# ---------- 3. 就地生成 / 更新 core\config.json ----------
+$cfgText = ''
+if (Test-Path -LiteralPath $CfgPath) {
+    try {
+        $raw = Get-Content -LiteralPath $CfgPath -Raw -Encoding UTF8
+        $null = $raw | ConvertFrom-Json
+        $cfgText = $raw
+        Info '已存在 config.json：保留其中的档位/画质等设置，仅更新 ffmpeg 与工作目录'
+    } catch {
+        $bak = $CfgPath + '.bad-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+        Move-Item -LiteralPath $CfgPath -Destination $bak -Force
+        Warn "原 config.json 无法解析，已备份为: $bak"
     }
 }
-
-foreach ($need in @('core\vpipe.py', 'core\compress_gui.py', 'ffmpeg批量压缩.bat')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $ScriptDir $need))) { Die "复制后仍缺少 $need（源目录是否完整？）" }
+if (-not $cfgText) {
+    $cfgText = Get-Content -LiteralPath $ExampleCfg -Raw -Encoding UTF8
+    Info '由 core\config.example.json 就地生成 config.json'
 }
+if ($cfgText -notmatch '"profiles"') { Die "配置模板无效（缺少 profiles 段）: $ExampleCfg" }
 
-# ---------- 6. 回写 config.json ----------
-$workDir = Join-Path $ScriptDir 'core\_work'
 $cfgText = Set-JsonStrField $cfgText 'ffmpeg_dir' $FfmpegDir
-$cfgText = Set-JsonStrField $cfgText 'work_dir' $workDir
-[System.IO.File]::WriteAllText($cfgPath, $cfgText, (New-Object System.Text.UTF8Encoding($false)))
+$cfgText = Set-JsonStrField $cfgText 'work_dir' $WorkDir
+[System.IO.File]::WriteAllText($CfgPath, $cfgText, (New-Object System.Text.UTF8Encoding($false)))
 
-try { $null = (Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
-catch { Warn "写入后的 config.json 校验失败，请检查: $cfgPath" }
+try { $null = (Get-Content -LiteralPath $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
+catch { Warn "写入后的 config.json 校验失败，请检查: $CfgPath" }
 
-# ---------- 7. 完成 ----------
+# ---------- 4. 完成 ----------
 Info ''
-Good '=========================== 安装完成 ==========================='
-Info "工具入口 : $ScriptDir\ffmpeg批量压缩.bat"
+Good '=========================== 初始化完成 ==========================='
+Info "仓库目录 : $Repo"
 Info "ffmpeg   : $FfmpegDir"
-Info "配置文件 : $cfgPath"
+Info "配置文件 : $CfgPath"
 Info ''
 Info '用法：把视频文件或文件夹拖到「ffmpeg批量压缩.bat」图标上即可。'
-Info '卸载：双击「一键卸载.bat」——只移除工具目录，ffmpeg 会保留。'
-Info '============================================================'
+Info '以后重新拉取代码或移动了仓库位置，再运行一次本初始化即可。'
+Info '==============================================================='
 exit 0
