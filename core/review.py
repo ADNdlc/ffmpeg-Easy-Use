@@ -39,6 +39,7 @@ import json
 import mimetypes
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -55,6 +56,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_NAME = 'review_page.html'
 REVIEW_NAME = 'review.json'
 PORT_NAME = 'review.port'
+APP_MARK = 'vpipe-review'                    # /api/ping 响应用于识别本应用实例
 DATA_DIR_NAME = vpipe.DATA_DIR_NAME          # 工作区下的数据目录（json + 端口文件都放这里）
 
 EXIT_OK = 0
@@ -63,6 +65,7 @@ EXIT_USAGE = 2
 
 CHUNK = 256 * 1024
 HISTORY_MAX = 400
+MAX_BODY = 8 * 1024 * 1024              # 单个请求体上限，避免超大 body 占用内存
 MISSING = object()
 
 _save_lock = threading.Lock()
@@ -156,7 +159,7 @@ def save_review(work, rv):
     """原子写：review.json.tmp -> os.replace。失败仅告警。
     加 _save_lock（进程内）与 review_file_lock（跨进程，压缩服务 vpipe 也会写同一个文件）。"""
     p = review_path(work)
-    tmp = p + '.tmp'
+    tmp = "%s.tmp.%d" % (p, os.getpid())
     rv['updated'] = now_str()
     with _save_lock:
         with vpipe.review_file_lock(work):
@@ -800,6 +803,8 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
         if n <= 0:
             return {}
+        if n > MAX_BODY:
+            return {}                       # 拒绝超大请求体，避免无谓的内存占用
         raw = self.rfile.read(n)
         try:
             data = json.loads(raw.decode('utf-8'))
@@ -836,11 +841,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({'ok': True, 'app': 'vpipe-review',
                                'version': 2, 'at': now_str()}, head_only=head_only)
         if p == '/api/queue':
-            st = self.server.state
-            q = urllib.parse.parse_qs(u.query)
-            if (q.get('rescan') or [''])[0] not in ('', '0'):
-                st.refresh(rescan=True)          # 打开页面时按文件系统重新扫描，避免读到旧快照
-            return self._json(st.payload(), head_only=head_only)
+            # 只读：GET 不再触发重扫（状态变更类操作统一走 POST /api/rescan），
+            # 避免被跨站 GET（无需预检即可发出）在用户不知情下触发全量扫描。
+            return self._json(self.server.state.payload(), head_only=head_only)
         if p == '/api/summary':
             st = self.server.state
             with st.lock:
@@ -1016,17 +1019,15 @@ def read_port_file(work):
         return None
 
 
-def write_port_file(work, port):
-    p = port_path(work)
-    tmp = p + '.tmp'
+def _ping_review_port(port):
+    """探测给定端口上是否为 vpipe 审阅服务实例。"""
     try:
-        os.makedirs(work, exist_ok=True)
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump({'pid': os.getpid(), 'port': port, 'at': now_str()}, f,
-                      ensure_ascii=False, indent=2)
-        os.replace(tmp, p)
-    except OSError as e:
-        vpipe.log("警告: 端口文件未能写入（%s）" % e)
+        with socket.create_connection(('127.0.0.1', int(port)), 1.5) as s:
+            s.sendall(b'GET /api/ping HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n')
+            data = s.recv(512).decode('utf-8', 'replace')
+        return APP_MARK in data
+    except (OSError, ValueError):
+        return False
 
 
 def alive_port(work):
@@ -1034,13 +1035,43 @@ def alive_port(work):
     d = read_port_file(work)
     if not d or not d.get('port'):
         return None
+    return int(d['port']) if _ping_review_port(d['port']) else None
+
+
+def claim_port_file(work, port):
+    """以独占（O_EXCL）方式登记端口文件，消除「两个实例同时启动、端口文件互相覆盖」的竞态。
+    返回 'ok'（已登记本实例）或 'taken'（已有活跃实例，调用方应复用而不是再起一个）。"""
+    p = port_path(work)
+    payload = json.dumps({'pid': os.getpid(), 'port': port, 'app': APP_MARK, 'at': now_str()},
+                         ensure_ascii=False, indent=2)
     try:
-        with socket.create_connection(('127.0.0.1', int(d['port'])), 1.5) as s:
-            s.sendall(b'GET /api/ping HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n')
-            data = s.recv(512).decode('utf-8', 'replace')
-        return int(d['port']) if 'vpipe-review' in data else None
-    except (OSError, ValueError):
-        return None
+        os.makedirs(work, exist_ok=True)
+    except OSError as e:
+        vpipe.log("警告: 工作区数据目录无法创建（%s）" % e)
+        return 'ok'
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, payload.encode('utf-8'))
+        finally:
+            os.close(fd)
+        return 'ok'
+    except FileExistsError:
+        d = read_port_file(work)
+        if d and d.get('port') and _ping_review_port(d['port']):
+            return 'taken'
+        tmp = "%s.tmp.%d" % (p, os.getpid())
+        try:                                                 # 遗留（进程已死）：接管覆盖
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(payload)
+            os.replace(tmp, p)
+            return 'ok'
+        except OSError:
+            vpipe._remove_quiet(tmp)
+            return 'taken'
+    except OSError as e:
+        vpipe.log("警告: 端口文件未能写入（%s）" % e)
+        return 'ok'
 
 
 def write_review_bat(ws):
@@ -1067,20 +1098,48 @@ def _parse_args():
     return ap.parse_args()
 
 
-def _stop_instance(work):
-    port = alive_port(work)
-    if not port:
-        vpipe.log("没有正在运行的审阅服务。")
-        return EXIT_OK
+def _pid_is_python(pid):
+    """校验 pid 是一个 python 进程，避免误杀复用该 PID 的无关进程。"""
     try:
-        req = urllib.request.Request('http://127.0.0.1:%d/api/shutdown' % port,
-                                     data=b'{}', method='POST')
-        urllib.request.urlopen(req, timeout=3).read()
-        vpipe.log("已请求关闭: http://127.0.0.1:%d/" % port)
+        out = subprocess.run(['tasklist', '/FI', 'PID eq %d' % int(pid), '/FO', 'CSV', '/NH'],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    return 'python' in out.stdout.decode('utf-8', 'replace').lower()
+
+
+def _kill_by_pid(pid):
+    """按进程号终止遗留实例（连带子进程）。非 python 进程则拒绝，避免误杀。"""
+    if not pid or not _pid_is_python(pid):
+        return False
+    try:
+        subprocess.run(['taskkill', '/PID', str(int(pid)), '/T', '/F'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        return True
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+def _stop_instance(work):
+    d = read_port_file(work) or {}
+    port = alive_port(work)
+    if port:
+        try:
+            req = urllib.request.Request('http://127.0.0.1:%d/api/shutdown' % port,
+                                         data=b'{}', method='POST')
+            urllib.request.urlopen(req, timeout=3).read()
+            vpipe.log("已请求关闭: http://127.0.0.1:%d/" % port)
+            return EXIT_OK
+        except OSError as e:
+            vpipe.log("提示: HTTP 关闭未成功（%s），改为按进程号兜底终止 ..." % e)
+    # HTTP 不可达或关闭失败时，按端口文件里的 pid 兜底，避免 --stop 形同虚设。
+    pid = d.get('pid')
+    if pid and d.get('app') == APP_MARK and _kill_by_pid(pid):
+        vpipe.log("已按进程号终止遗留实例（pid=%s）。" % pid)
+        vpipe._remove_quiet(port_path(work))
         return EXIT_OK
-    except OSError as e:
-        vpipe.log("关闭失败（%s）；如服务仍在，请改用任务管理器结束该 python 进程。" % e)
-        return EXIT_FAIL
+    vpipe.log("没有正在运行的审阅服务。")
+    return EXIT_OK
 
 
 def _run(args):
@@ -1123,7 +1182,19 @@ def _run(args):
     httpd.state = st
     st.httpd = httpd
     real_port = httpd.server_address[1]
-    write_port_file(work, real_port)
+    if claim_port_file(work, real_port) == 'taken':
+        # 启动竞态：另一实例抢先登记并存活，关闭本实例监听并复用它。
+        try:
+            httpd.server_close()
+        except OSError:
+            pass
+        other = alive_port(work)
+        if other:
+            url = 'http://127.0.0.1:%d/' % other
+            vpipe.log("审阅服务已在运行，直接复用: " + url)
+            if not args.no_browser:
+                webbrowser.open(url)
+        return EXIT_OK
     bat = write_review_bat(ws)
 
     url = 'http://127.0.0.1:%d/' % real_port

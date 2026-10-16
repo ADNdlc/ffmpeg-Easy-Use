@@ -238,7 +238,9 @@
   // ---------- 加载与渲染
   function load(keepPos, rescan){
     var g0 = gi, c0 = ci;
-    return fetch('/api/queue' + (rescan ? '?rescan=1' : '')).then(function(r){ return r.json(); }).then(function(d){
+    // 重扫是「改状态」操作，改走 POST /api/rescan；随后再以只读 GET 拉队列。
+    var pre = rescan ? api('/api/rescan', {}) : Promise.resolve(null);
+    return pre.then(function(){ return fetch('/api/queue', {cache:'no-store'}); }).then(function(r){ return r.json(); }).then(function(d){
       if (d.error){ say(d.error, true); return; }
       Q = d;
       var n = Q.groups.length;

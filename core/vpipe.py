@@ -236,6 +236,39 @@ def _remove_quiet(path):
         pass
 
 
+# 输出扩展名 -> 可接受的封装修复器（ffmpeg 按输出扩展名选择复用器）
+EXT_CONTAINERS = {
+    '.mp4': ('mp4',), '.m4v': ('mp4',),
+    '.mov': ('mov',),
+    '.mkv': ('matroska', 'mkv'),
+    '.webm': ('webm', 'matroska'),
+    '.ts': ('mpegts',), '.m2ts': ('mpegts',),
+}
+
+
+def output_ext_container_warn(cfg):
+    """校验 output_ext 与各档位 container 是否一致。不一致时 ffmpeg 会按扩展名选复用器，
+    可能写头失败或产出封装与扩展名不符（如 .mkv 扩展 + mp4 封装）。
+    返回提示串或 None（仅告警，不阻断启动）。"""
+    ext = (cfg.get('output_ext') or '.mp4').lower()
+    if not ext.startswith('.'):
+        ext = '.' + ext
+    allowed = EXT_CONTAINERS.get(ext)
+    if not allowed:
+        return None
+    profs = cfg.get('profiles') or {}
+    if not isinstance(profs, dict):
+        return None
+    for name, p in profs.items():
+        if not isinstance(p, dict):
+            continue
+        cont = (p.get('container') or 'mp4').lower()
+        if cont not in allowed:
+            return ("output_ext=%s 与档位 %s 的 container=%s 不一致；ffmpeg 按输出扩展名选择"
+                    "复用器，可能写头失败或产出与扩展名不符，请改为一致的组合。" % (ext, name, cont))
+    return None
+
+
 def load_config(path):
     if not os.path.isfile(path):
         # 仓库里放的是 config.example.json，初始化脚本据此就地生成 config.json（后者被
@@ -258,13 +291,11 @@ def load_config(path):
         die("无法读取配置文件: %s（%s）" % (path, e))
     if not isinstance(cfg, dict):
         die("配置文件内容必须是 JSON 对象: " + path)
-    if not isinstance(cfg.get('work_dir'), str) or not cfg.get('work_dir'):
-        # 路径字段留空、由初始化脚本写入。未初始化就直接运行（例如刚克隆完就双击入口）时，
-        # 工作目录默认落到 core\_work——与初始化写入的位置一致，避免仅因为没初始化就报错退出。
-        cfg['work_dir'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_work')
-        log("提示: config.json 未设置 work_dir，本次使用 " + cfg['work_dir'])
     if not isinstance(cfg.get('profiles'), dict) or not cfg.get('profiles'):
         die("配置缺少必需的 profiles（非空对象）: " + path)
+    warn = output_ext_container_warn(cfg)
+    if warn:
+        log("警告: " + warn)
     return cfg
 
 
@@ -376,8 +407,8 @@ def probe(ffprobe, path):
         return None
 
 
-def stream_bitrate_kbps(s, fmt):
-    """流码率：优先流自身的 bit_rate，否则用 (文件大小*8/时长 - 其他流) 估算。"""
+def stream_bitrate_kbps(s):
+    """流码率：优先取流自身的 bit_rate；取不到时返回 0，由调用方用「文件大小-其他流」估算。"""
     b = to_int(s.get('bit_rate'))
     if b > 0:
         return int(b / 1000)
@@ -406,10 +437,10 @@ def make_record(ffprobe, path, rel):
         size = to_int(fmt.get('size'))
     dur = to_float(fmt.get('duration'))
     # 视频码率
-    vb = stream_bitrate_kbps(v, fmt) if v else 0
+    vb = stream_bitrate_kbps(v) if v else 0
     if v and vb == 0 and dur > 0 and size:
         total_kbps = int(size * 8 / dur / 1000)
-        ab = stream_bitrate_kbps(a, fmt) if a else 0
+        ab = stream_bitrate_kbps(a) if a else 0
         vb = max(0, total_kbps - ab)
     # 旋转
     rotation = 0
@@ -440,7 +471,7 @@ def make_record(ffprobe, path, rel):
         'bit_depth': bit_depth,
         'vbitrate_kbps': vb,
         'acodec': (a or {}).get('codec_name', ''),
-        'abitrate_kbps': stream_bitrate_kbps(a, fmt) if a else 0,
+        'abitrate_kbps': stream_bitrate_kbps(a) if a else 0,
         'achannels': to_int((a or {}).get('channels')),
         'asample': to_int((a or {}).get('sample_rate')),
         'rotation': rotation,
@@ -461,27 +492,52 @@ def make_record(ffprobe, path, rel):
 
 
 def is_part_file(name):
-    return '.part.' in name
+    """是否为管线的 `.part` 中间文件。
+    仅当最后一个 `.part` 之后紧跟一个已知视频扩展名时才判定为中间文件（如 foo_hevc.part.mp4，
+    由 part_path_for 生成），避免误伤 movie.part.1.mp4 / a.part.of.history.mp4 这类含 `.part.`
+    的合法文件名（分卷下载、下载器命名习惯很常见）。name 可为完整路径或纯文件名。"""
+    base = os.path.basename(name)
+    idx = base.rfind('.part')
+    if idx <= 0:
+        return False
+    ext = base[idx + len('.part'):]          # 形如 '.mp4'
+    if ext.count('.') != 1:                  # '.1.mp4' / '.of.history.mp4' 等多段后缀 → 合法文件
+        return False
+    return ext.lower() in VIDEO_EXT
 
 
 def iter_files(indir, exclude_dirs=()):
     """遍历视频文件；跳过 .part 中间文件；不可读目录仅告警不崩溃。"""
     exclude = set(os.path.normcase(os.path.abspath(d)) for d in exclude_dirs)
     unreadable = []
+    skipped_work = []
 
     def _onerror(err):
         unreadable.append(err)
 
     for root, dirs, files in os.walk(indir, onerror=_onerror):
-        dirs[:] = [d for d in dirs
-                   if os.path.normcase(os.path.abspath(os.path.join(root, d))) not in exclude
-                   and not d.startswith('_work') and d != DATA_DIR_NAME]
+        keep = []
+        for d in dirs:
+            full = os.path.join(root, d)
+            if os.path.normcase(os.path.abspath(full)) in exclude:
+                continue
+            if d == DATA_DIR_NAME:
+                continue
+            if d.startswith('_work'):
+                # 名称以 _work 开头的目录一律跳过（内部数据目录约定）；但不静默，
+                # 明确告知用户，避免把「工作目录被排除」误认为「文件被漏掉」。
+                skipped_work.append(full)
+                continue
+            keep.append(d)
+        dirs[:] = keep
         for fn in sorted(files):
             if is_part_file(fn):
                 continue
             if os.path.splitext(fn)[1].lower() in VIDEO_EXT:
                 p = os.path.join(root, fn)
                 yield p, os.path.relpath(p, indir)
+    for d in skipped_work:
+        log("  [提示] 已跳过名称以 _work 开头的目录: %s" % d)
     for err in unreadable:
         log("  [警告] 目录无法读取，已跳过: %s" % getattr(err, 'filename', err))
 
@@ -535,7 +591,7 @@ def _migrate_state_items(items):
 def save_state(work, profile, st):
     """原子写入状态：临时文件 + os.replace；失败仅告警，绝不因日志/缓存目录问题中断编码。"""
     p = state_path(work, profile)
-    tmp = p + '.tmp'
+    tmp = "%s.tmp.%d" % (p, os.getpid())
     try:
         os.makedirs(work, exist_ok=True)
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -822,7 +878,7 @@ def mark_review_pending(work, pairs, root=''):
                     for f in ('kind', 'parent', 'delete', 'filtered', 'reviewed', 'cleaned', 'history'):
                         it.setdefault(f, fresh[f])
         rv['updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
-        tmp = p + '.tmp'
+        tmp = "%s.tmp.%d" % (p, os.getpid())
         try:
             os.makedirs(work, exist_ok=True)
             with open(tmp, 'w', encoding='utf-8') as f:
@@ -844,9 +900,11 @@ def write_review_shortcut(ws):
     review_py = os.path.join(here, 'review.py')
     cfg_path = os.path.join(here, 'config.json')
     p = os.path.join(ws, REVIEW_BAT_NAME)
+    # 用当前解释器的绝对路径，避免 python 不在 PATH 时审阅入口失效；取不到时退回 "python"。
+    py = sys.executable or 'python'
     body = [
-        'python "%s" --config "%s" --input "%s" --work "%s" %%*' % (
-            review_py, cfg_path, ws, ws),
+        '"%s" "%s" --config "%s" --input "%s" --work "%s" %%*' % (
+            py, review_py, cfg_path, ws, ws),
         'set "RC=%ERRORLEVEL%"',
         'if not "%RC%"=="0" echo   注意: 审阅服务未能正常结束（退出码 %RC%）。',
         'if not "%RC%"=="0" pause',
@@ -1827,6 +1885,10 @@ def cmd_report(args):
     prof_name, _profile = pick_profile(cfg, args.profile)
     out_root = _profile_out_root(cfg, prof_name)
     ws = resolve_workspace(cfg, args.work, out_root)
+    if not args.work and not out_root and not cfg.get('input_dir'):
+        # samedir 模式下 input_dir 为空时，resolve_workspace 会退化到 CWD，
+        # 导致误读当前目录的状态。这里显式报错，要求指定 --work。
+        die("无法确定工作区：请用 --work 指定目标目录（或配置 input_dir）")
     work = data_dir_of(ws)
     st = load_state(work, prof_name)
     if not st['items']:
@@ -1905,6 +1967,8 @@ def cmd_compare(args):
     prof_name, _profile = pick_profile(cfg, args.profile)
     out_root = _profile_out_root(cfg, prof_name)
     ws = resolve_workspace(cfg, args.work, out_root)
+    if not args.work and not out_root and not cfg.get('input_dir'):
+        die("无法确定工作区：请用 --work 指定目标目录（或配置 input_dir）")
     work = data_dir_of(ws)
     st = load_state(work, prof_name)
     if not st['items']:

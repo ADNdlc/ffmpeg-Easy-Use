@@ -245,7 +245,7 @@
 "use strict";
 var S = {profiles:[], presets:[], paths:[], config_path:"", default_profile:"", resolution:{}};
 var cur = {profile:"", quality:28, preset:"p5"};
-var lastSeq = 0, lastJobId = "", polling = false, running = false, timer = null;
+var lastSeq = 0, lastJobId = "", lastDoneKey = "", polling = false, running = false, timer = null;
 
 /* ---------------- 小工具 ---------------- */
 function $(id){ return document.getElementById(id); }
@@ -487,8 +487,12 @@ async function poll(){
     renderJob(r.job || {}, r.result || {});
     if (!r.running && r.result && r.result.exit !== null && r.result.exit !== undefined){
       var e = r.result.exit;
-      say($("runMsg"), e === 0 ? "全部完成。" : (e === 130 ? "任务已被取消。" : "任务结束，退出码 " + e + "（可能有未成功的文件，详见日志）"),
-          e === 0 ? "ok" : (e === 130 ? "" : "err"));
+      var doneKey = String(lastJobId) + ":" + e;   // 同一任务的同一退出码只提示一次，避免每轮轮询重刷
+      if (doneKey !== lastDoneKey){
+        lastDoneKey = doneKey;
+        say($("runMsg"), e === 0 ? "全部完成。" : (e === 130 ? "任务已被取消。" : "任务结束，退出码 " + e + "（可能有未成功的文件，详见日志）"),
+            e === 0 ? "ok" : (e === 130 ? "" : "err"));
+      }
     }
   } catch(err){ /* 服务关闭时不刷错 */ }
   schedule();
@@ -539,7 +543,7 @@ function bindUI(){
   $("btnLoadPath").onclick = function(){
     var p = $("presetPath").value.trim();
     if (!p){ say($("presetMsg"), "请填写预设/配置路径", "err"); return; }
-    api("/api/preset?path=" + encodeURIComponent(p)).then(function(r){
+    api("/api/preset", {path:p}).then(function(r){
       if (r.kind === "config"){
         applyStateFromServer(r.state);
         say($("presetMsg"), "已切换配置基底：" + r.path, "ok");

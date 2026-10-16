@@ -4,7 +4,6 @@
   "output_mode": "samedir",
   "output_ext": ".mp4",
   "output_dir": "",
-  "work_dir": "",
   "default_profile": "hevc_nvenc",
   "skip_efficient_codecs": ["hevc", "av1"],
   "skip_bitrate_kbps": 6000,

@@ -23,7 +23,7 @@
 
   初始化产物（全部落在仓库目录内）:
     core\config.json   ← 由 core\config.example.json 就地生成；
-                          已存在则保留其中的档位/画质设置，只更新 ffmpeg 与工作目录
+                          已存在则保留其中的档位/画质设置，只更新 ffmpeg 目录
     bin\               ← 仅在没有可用 ffmpeg 时产生（自动下载的 ffmpeg）
 #>
 param(
@@ -135,7 +135,6 @@ $CoreDir = Join-Path $Repo 'core'
 $BinDir = Join-Path $Repo 'bin'
 $ExampleCfg = Join-Path $CoreDir 'config.example.json'
 $CfgPath = Join-Path $CoreDir 'config.json'
-$WorkDir = Join-Path $CoreDir '_work'
 
 if (-not (Test-Path -LiteralPath $ExampleCfg)) { Die "缺少配置模板: $ExampleCfg" }
 Info "仓库目录 : $Repo"
@@ -161,7 +160,6 @@ if ($DryRun) {
     Info '------------------ 预演（不修改任何文件） ------------------'
     Info "配置文件 : $CfgPath$(if ($hasCfg) { '（已存在，将保留档位/画质设置，仅更新路径）' } else { '（将由 config.example.json 生成）' })"
     Info "ffmpeg   : $(if ($needFfmpeg) { "$BinDir（需要获取：会先询问是否下载）" } else { $FfmpegDir })"
-    Info "工作目录 : $WorkDir"
     Info "来源     : $(if ($FfmpegZip) { "指定来源: $FfmpegZip" } elseif ($needFfmpeg) { $ONLINE[0] } else { '复用已有 ffmpeg' })"
     Info '----------------------------------------------------------'
     exit 0
@@ -224,7 +222,7 @@ if (Test-Path -LiteralPath $CfgPath) {
         $raw = Get-Content -LiteralPath $CfgPath -Raw -Encoding UTF8
         $null = $raw | ConvertFrom-Json
         $cfgText = $raw
-        Info '已存在 config.json：保留其中的档位/画质等设置，仅更新 ffmpeg 与工作目录'
+        Info '已存在 config.json：保留其中的档位/画质等设置，仅更新 ffmpeg 目录'
     } catch {
         $bak = $CfgPath + '.bad-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
         Move-Item -LiteralPath $CfgPath -Destination $bak -Force
@@ -238,7 +236,6 @@ if (-not $cfgText) {
 if ($cfgText -notmatch '"profiles"') { Die "配置模板无效（缺少 profiles 段）: $ExampleCfg" }
 
 $cfgText = Set-JsonStrField $cfgText 'ffmpeg_dir' $FfmpegDir
-$cfgText = Set-JsonStrField $cfgText 'work_dir' $WorkDir
 [System.IO.File]::WriteAllText($CfgPath, $cfgText, (New-Object System.Text.UTF8Encoding($false)))
 
 try { $null = (Get-Content -LiteralPath $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json) }

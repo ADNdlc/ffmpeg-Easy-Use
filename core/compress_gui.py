@@ -63,6 +63,7 @@ RUN_DIR = os.path.join(GUI_HOME, 'gui', 'run')
 LAST_STATE = os.path.join(GUI_HOME, 'gui', 'last_state.json')
 
 EVENTS_MAX = 400
+MAX_BODY = 8 * 1024 * 1024              # 单个请求体上限，避免超大 body 占用内存
 _JOB_SEQ = itertools.count(1)                  # 给 job_id 加进程内自增序号，避免同秒内重复
 DEFAULT_PRESET_FILE = '默认预设_config.json'   # 脚本目录下的示例预设，启动时自动加载
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
@@ -81,7 +82,7 @@ def atomic_write(path, text):
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
-    tmp = path + '.part'
+    tmp = "%s.part.%d" % (path, os.getpid())
     with open(tmp, 'w', encoding='utf-8') as f:
         f.write(text)
     os.replace(tmp, path)
@@ -234,11 +235,9 @@ def load_preset_file(path):
     return {'ok': True, 'kind': 'presets', 'path': path, 'presets': out}
 
 
-def absorb_config(data, base):
-    """把外部完整配置吸收为可用基底：补齐 vpipe 必需的 work_dir。失败返回 None。"""
+def absorb_config(data):
+    """把外部完整配置吸收为可用基底（要求含非空 profiles）。失败返回 None。"""
     cfg = copy.deepcopy(data)
-    if not isinstance(cfg.get('work_dir'), str) or not cfg.get('work_dir'):
-        cfg['work_dir'] = base.get('work_dir') or os.path.join(HERE, '_work')
     if not isinstance(cfg.get('profiles'), dict) or not cfg['profiles']:
         return None
     return cfg
@@ -563,7 +562,8 @@ class Runner:
             with self.lock:
                 self.finished = time.time()
                 self.exit = code
-                self.percent = 100.0
+                if code == 0:                 # 仅成功才置 100%，取消/失败保留最后实际进度
+                    self.percent = 100.0
             self._push({'kind': 'end', 'text': '任务结束（退出码 %s）' % code,
                         'exit': code})
             self._safe_remove(tmp)      # 只清理本次任务自己的临时配置（不是 self.tmp_cfg）
@@ -700,7 +700,7 @@ class State:
                 self.last_ws = b0 if os.path.isdir(b0) else os.path.dirname(b0)
 
     def set_base_config(self, data, path):
-        cfg = absorb_config(data, self.base_cfg)
+        cfg = absorb_config(data)
         if cfg is None:
             return False
         with self.lock:
@@ -824,6 +824,8 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
         if n <= 0:
             return {}
+        if n > MAX_BODY:
+            return {}                       # 拒绝超大请求体，避免无谓的内存占用
         try:
             data = json.loads(self.rfile.read(n).decode('utf-8'))
         except (ValueError, UnicodeDecodeError):
@@ -868,22 +870,8 @@ class Handler(BaseHTTPRequestHandler):
                 body['paths'] = list(st.paths)
             return self._json(body, head_only=head_only)
         if p == '/api/preset':
-            q = urllib.parse.parse_qs(u.query)
-            path = (q.get('path') or [''])[0]
-            if not path:
-                return self._json({'error': '缺少 path'}, 400)
-            r = load_preset_file(path)
-            if r.get('error'):
-                return self._json(r, 400)
-            if r.get('kind') == 'config':
-                if not st.set_base_config(r['config'], path):
-                    return self._json({'error': '该配置缺少可用的 profiles'}, 400)
-                return self._json({'ok': True, 'kind': 'config', 'path': path,
-                                   'state': dict(st.payload(), ok=True)})
-            st.file_presets = r['presets']
-            st.file_preset_path = path
-            return self._json({'ok': True, 'kind': 'presets', 'path': path,
-                               'presets': r['presets']})
+            # 兼容旧调用：已改走 POST（见 do_POST），GET 不再改状态。此处仅提示。
+            return self._json({'error': '请改用 POST /api/preset（GET 已禁止改状态）'}, 405)
         return self._text(404, '未找到: ' + p)
 
     def _page(self, head_only):
@@ -954,6 +942,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({'error': '启动审阅失败: %s' % e}, 400)
             return self._json({'ok': True})
 
+        if p == '/api/preset':
+            path = (data.get('path') or '').strip()
+            if not path:
+                return self._json({'error': '缺少 path'}, 400)
+            r = load_preset_file(path)
+            if r.get('error'):
+                return self._json(r, 400)
+            if r.get('kind') == 'config':
+                if not st.set_base_config(r['config'], path):
+                    return self._json({'error': '该配置缺少可用的 profiles'}, 400)
+                return self._json({'ok': True, 'kind': 'config', 'path': path,
+                                   'state': dict(st.payload(), ok=True)})
+            st.file_presets = r['presets']
+            st.file_preset_path = path
+            return self._json({'ok': True, 'kind': 'presets', 'path': path,
+                               'presets': r['presets']})
+
         if p == '/api/pick_preset':
             path = pick_preset_file()
             if path is None:
@@ -1014,26 +1019,49 @@ def read_port_file():
         return None
 
 
-def write_port_file(port):
+def _ping_port(port):
+    """探测给定端口上是否为本次运行的压缩入口实例。"""
     try:
-        atomic_write(port_path(), json.dumps(
-            {'pid': os.getpid(), 'port': port, 'app': APP_NAME, 'at': now_str()},
-            ensure_ascii=False, indent=2))
-    except OSError as e:
-        vpipe.log("警告: 端口文件未能写入（%s）" % e)
+        with socket.create_connection(('127.0.0.1', int(port)), 1.5) as s:
+            s.sendall(b'GET /api/ping HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n')
+            data = s.recv(512).decode('utf-8', 'replace')
+        return APP_NAME in data
+    except (OSError, ValueError):
+        return False
 
 
 def alive_port():
     d = read_port_file()
     if not d or not d.get('port'):
         return None
+    return int(d['port']) if _ping_port(d['port']) else None
+
+
+def claim_port_file(port):
+    """以独占（O_EXCL）方式登记端口文件，消除「两个实例同时启动、端口文件互相覆盖」的竞态。
+    返回 'ok'（已登记本实例）或 'taken'（已有活跃实例，调用方应复用而不是再起一个）。"""
+    p = port_path()
+    payload = json.dumps({'pid': os.getpid(), 'port': port, 'app': APP_NAME, 'at': now_str()},
+                         ensure_ascii=False, indent=2)
     try:
-        with socket.create_connection(('127.0.0.1', int(d['port'])), 1.5) as s:
-            s.sendall(b'GET /api/ping HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n')
-            data = s.recv(512).decode('utf-8', 'replace')
-        return int(d['port']) if APP_NAME in data else None
-    except (OSError, ValueError):
-        return None
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, payload.encode('utf-8'))
+        finally:
+            os.close(fd)
+        return 'ok'
+    except FileExistsError:
+        d = read_port_file()
+        if d and d.get('port') and _ping_port(d.get('port')):
+            return 'taken'                                   # 另一实例仍活跃
+        try:                                                 # 遗留（进程已死）：接管覆盖
+            atomic_write(p, payload)
+            return 'ok'
+        except OSError:
+            return 'taken'
+    except OSError as e:
+        vpipe.log("警告: 端口文件未能写入（%s）" % e)
+        return 'ok'
 
 
 def _parse_args():
@@ -1049,13 +1077,47 @@ def _parse_args():
     return ap.parse_args()
 
 
+def _pid_is_python(pid):
+    """校验 pid 是一个 python 进程，避免误杀复用该 PID 的无关进程。"""
+    try:
+        out = subprocess.run(['tasklist', '/FI', 'PID eq %d' % int(pid), '/FO', 'CSV', '/NH'],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    return 'python' in out.stdout.decode('utf-8', 'replace').lower()
+
+
+def _kill_by_pid(pid):
+    """按进程号终止遗留实例（连带子进程）。非 python 进程则拒绝，避免误杀。"""
+    if not pid or not _pid_is_python(pid):
+        return False
+    try:
+        subprocess.run(['taskkill', '/PID', str(int(pid)), '/T', '/F'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        return True
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
 def _stop_instance():
+    d = read_port_file() or {}
     port = alive_port()
-    if not port:
-        vpipe.log("没有正在运行的压缩入口服务。")
+    if port:
+        r = _post_json(port, '/api/shutdown', {})
+        if r.get('ok') or r.get('message'):
+            vpipe.log("已请求关闭: http://127.0.0.1:%d/（%s）" % (port, r.get('message') or 'ok'))
+            return EXIT_OK
+        vpipe.log("提示: HTTP 关闭未成功（可能页面/端口不可达），改为按进程号兜底终止 ...")
+    # HTTP 不可达或关闭失败时，按端口文件里的 pid 兜底，避免 --stop 形同虚设。
+    pid = d.get('pid')
+    if pid and d.get('app') == APP_NAME and _kill_by_pid(pid):
+        vpipe.log("已按进程号终止遗留实例（pid=%s）。" % pid)
+        try:
+            os.remove(port_path())
+        except OSError:
+            pass
         return EXIT_OK
-    r = _post_json(port, '/api/shutdown', {})
-    vpipe.log("已请求关闭: http://127.0.0.1:%d/（%s）" % (port, r.get('message') or 'ok'))
+    vpipe.log("没有正在运行的压缩入口服务。")
     return EXIT_OK
 
 
@@ -1103,7 +1165,25 @@ def _run(args):
     httpd.state = st
     st.httpd = httpd
     real_port = httpd.server_address[1]
-    write_port_file(real_port)
+    if claim_port_file(real_port) == 'taken':
+        # 启动竞态：另一实例抢先登记。关闭本实例监听并复用它，避免同机出现两个服务。
+        try:
+            httpd.server_close()
+        except OSError:
+            pass
+        other = alive_port()
+        if other:
+            url = 'http://127.0.0.1:%d/' % other
+            vpipe.log("压缩入口已在运行，直接复用: " + url)
+            if args.paths:
+                r = _post_json(other, '/api/add_paths', {'paths': args.paths})
+                for p in (r.get('added') or []):
+                    vpipe.log("  已加入待处理列表: " + p)
+                for b in (r.get('rejected') or []):
+                    vpipe.log("  [忽略] 路径不存在: " + b)
+            elif not args.no_browser:
+                webbrowser.open(url)
+        return EXIT_OK
 
     url = 'http://127.0.0.1:%d/' % real_port
     vpipe.log("压缩入口已就绪: " + url)

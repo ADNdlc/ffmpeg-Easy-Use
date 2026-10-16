@@ -120,7 +120,7 @@ ffmpeg-Easy-Use\
     └─ 默认预设_config.json
 ```
 
-初始化**不复制任何文件**，初始化若下载了 ffmpeg 会放进 `<仓库>\bin\`，工作目录是 `<仓库>\core\_work`。程序内部一律按“脚本自身目录”相对定位，所以 `core\` 里的脚本、`config.json`、两个 `.html` 和预设必须待在同一目录。
+初始化**不复制任何文件**，初始化若下载了 ffmpeg 会放进 `<仓库>\bin\`。每个被处理的目录就是一个独立工作区：状态与审阅数据都存在该目录下的 `.data\`；压缩入口自身的运行数据放在 `<仓库>\core\_work\.data`。程序内部一律按“脚本自身目录”相对定位，所以 `core\` 里的脚本、`config.json`、两个 `.html` 和预设必须待在同一目录。
 
 
 
@@ -153,7 +153,7 @@ ffmpeg-Easy-Use\
 2. `PATH` 里检测到 `ffmpeg.exe` → 记下它所在目录，直接复用（不下载、不复制）；
 3. 都没有 → 询问是否下载 essentials 版到 `<仓库>\bin`。
 
-随后就地生成 `core\config.json`（模板为 `core\config.example.json`，生成的 `config.json` 被 `.gitignore` 忽略），并写入上面的 ffmpeg 目录与工作目录 `<仓库>\core\_work`。
+随后就地生成 `core\config.json`（模板为 `core\config.example.json`，生成的 `config.json` 被 `.gitignore` 忽略），并写入上面得到的 ffmpeg 目录。
 
 想手动放置 ffmpeg：把 `ffmpeg.exe` / `ffprobe.exe` 放进 `<仓库>\bin` 后再运行初始化。
 
@@ -161,7 +161,7 @@ ffmpeg-Easy-Use\
 
 初始化**只新增或覆盖本目录文件，不动其他数据**：
 
-- 已存在 `config.json` → 就地更新，**保留你 `config.json` 里的档位与画质设置**，只更新其中的 ffmpeg 与工作目录；
+- 已存在 `config.json` → 就地更新，**保留你 `config.json` 里的档位与画质设置**，只更新其中的 ffmpeg 目录；
 - `config.json` 存在但无法解析 → 备份为 `*.bad-<时间戳>` 后重新从模板生成；
 - `<仓库>\bin` 已有 ffmpeg → 跳过下载；
 - 只有 `ffmpeg.exe` 而缺 `ffprobe.exe` → 视为不可用，按“没有 ffmpeg”处理。
