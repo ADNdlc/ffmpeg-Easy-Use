@@ -55,6 +55,9 @@
   .card .t{font-size:13px; font-weight:600;}
   .card .d{font-size:11.5px; color:var(--fg2);}
   .card .enc{font-family:var(--mono); font-size:11px; color:var(--fg3);}
+  .card.dis{opacity:.5; cursor:not-allowed; border-style:dashed;}
+  .card.dis:hover{border-color:var(--line2);}
+  .card .na{font-size:11.5px; color:var(--danger); margin-top:2px;}
 
   .paths{list-style:none; margin:0; padding:0; max-height:190px; overflow:auto;}
   .paths li{display:flex; align-items:center; gap:8px; padding:4px 0;
@@ -120,6 +123,7 @@
   <!-- 2. 档位 -->
   <section>
     <h2>2 · 编码格式（档位）</h2>
+    <div class="tip" id="hwTip" style="display:none;"></div>
     <div class="cards" id="cards"></div>
   </section>
 
@@ -307,18 +311,28 @@ function renderCards(){
   var box = $("cards");
   box.innerHTML = "";
   S.profiles.forEach(function(p){
+    var dis = (p.available === false);
     var d = document.createElement("div");
-    d.className = "card" + (p.name === cur.profile ? " on" : "");
+    d.className = "card" + (p.name === cur.profile ? " on" : "") + (dis ? " dis" : "");
     d.innerHTML = '<div class="t">' + esc(p.name) + '</div>'
                 + '<div class="d">' + esc(p.description || "") + '</div>'
-                + '<div class="enc">' + esc(p.encoder || "") + ' · 后缀 _' + esc(p.tag || "") + '</div>';
+                + '<div class="enc">' + esc(p.encoder || "") + ' · 后缀 _' + esc(p.tag || "") + '</div>'
+                + (dis ? '<div class="na">本机不支持：' + esc(p.unavailable_reason || "硬件编码器不可用") + '</div>' : '');
     d.onclick = function(){ selectProfile(p.name); };
     box.appendChild(d);
   });
 }
+function hwHints(p){
+  return '（本机不支持：' + ((p && p.unavailable_reason) || "硬件编码器不可用")
+       + '）请改用软件档位（x265 / x264），或换到具备 NVIDIA 显卡的机器。';
+}
 function selectProfile(name){
-  cur.profile = name;
   var p = profileOf(name);
+  if (p && p.available === false){
+    say($("runMsg"), "档位「" + name + "」" + hwHints(p), "err");
+    return false;
+  }
+  cur.profile = name;
   var q = vparamsNum(p, ["-cq","-crf","-qp"]);
   if (q !== null && !isNaN(q)){ cur.quality = q; $("quality").value = q; }
   var ps = vparamsStr(p, "-preset");
@@ -333,6 +347,19 @@ function selectProfile(name){
   if (!ps){ sel.value = presetOptionsFor(p)[4] || sel.options[0].value; cur.preset = sel.value; }
   $("qVal").textContent = "（当前 " + cur.quality + "）";
   renderCards();
+  return true;
+}
+function renderHwTip(){
+  var el = $("hwTip");
+  var h = S.hwcaps || {};
+  if (!h.probed || !h.encoders){ el.style.display = "none"; return; }
+  var names = {hevc_nvenc:"HEVC", h264_nvenc:"H.264", av1_nvenc:"AV1"};
+  var ok = [], no = [];
+  Object.keys(names).forEach(function(k){ (h.encoders[k] ? ok : no).push(names[k]); });
+  var txt = "本机硬件加速探测：" + (ok.length ? ("NVENC 支持 " + ok.join("/")) : "未检测到可用的 NVIDIA NVENC")
+          + (no.length ? ("；不支持 " + no.join("/") + "（对应档位已灰显，不可选）") : "。");
+  el.style.display = "";
+  el.textContent = txt;
 }
 function renderPaths(){
   var ul = $("paths");
@@ -367,7 +394,19 @@ function renderPresets(){
 }
 function renderState(){
   $("cfgPath").textContent = "配置基底: " + (S.config_path || "—");
-  renderCards(); renderPaths(); renderPresets();
+  renderHwTip(); renderCards(); renderPaths(); renderPresets();
+}
+/* 选一个本机可用的默认档位：默认档位不可用时（灰档）回落到第一个可用档位 */
+function pickDefaultProfile(){
+  var d = S.default_profile || "";
+  var found = false, dp = null, okp = null;
+  S.profiles.forEach(function(p){
+    if (p.name === d){ found = true; dp = p; }
+    if (!okp && p.available !== false) okp = p.name;
+  });
+  if (!found) d = S.profiles.length ? S.profiles[0].name : "";
+  if (dp && dp.available !== false) return d;
+  return okp || d;
 }
 /* 服务端切换了配置基底后：整份状态换新，并重新选一次档位 */
 function applyStateFromServer(state){
@@ -375,8 +414,7 @@ function applyStateFromServer(state){
   S.presets = state.presets || S.presets || [];
   S.paths = state.paths || [];
   if (S.profiles.length){
-    var d = S.default_profile || S.profiles[0].name;
-    selectProfile(profileOf(d) ? d : S.profiles[0].name);
+    selectProfile(pickDefaultProfile());
   }
   renderState();
 }
@@ -384,7 +422,12 @@ function applyStateFromServer(state){
 /* ---------------- 预设应用 ---------------- */
 function applyPreset(p, quiet){
   if (!p) return;
-  if (p.base_profile && p.base_profile !== cur.profile) selectProfile(p.base_profile);
+  if (p.base_profile && p.base_profile !== cur.profile){
+    if (!selectProfile(p.base_profile)){
+      say($("presetMsg"), "该预设的档位「" + p.base_profile + "」" + hwHints(profileOf(p.base_profile)) + " 未套用。", "err");
+      return;
+    }
+  }
   if (p.quality !== null && p.quality !== undefined){ cur.quality = p.quality; $("quality").value = p.quality; }
   if (p.preset){ cur.preset = p.preset; var sel=$("preset"); sel.value = p.preset; }
   if (p.resolution && p.resolution.max_long_side !== undefined){
@@ -606,8 +649,7 @@ async function boot(){
     S = Object.assign(S, st);
     bindUI();
     if (!S.profiles.length){ say($("runMsg"), "配置里没有可用的 profiles，请检查 config.json", "err"); return; }
-    var def = S.default_profile || S.profiles[0].name;
-    selectProfile(def);
+    selectProfile(pickDefaultProfile());
     renderState();
     if (S.resolution && S.resolution.max_long_side !== undefined){
       var v = String(S.resolution.max_long_side || 0);

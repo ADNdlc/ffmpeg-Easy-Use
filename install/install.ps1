@@ -48,6 +48,14 @@ function Good($m) { Write-Host $m -ForegroundColor Green }
 function Warn($m) { Write-Host $m -ForegroundColor Yellow }
 function Bad($m) { Write-Host $m -ForegroundColor Red }
 function Die($m) { Bad ''; Bad "[初始化失败] $m"; exit 2 }
+# 图形化失败提示：仅在交互式控制台弹出，避免在自动化 / 输入输出被重定向时阻塞
+function PopError([string]$m) {
+    try {
+        if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { return }
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        [System.Windows.Forms.MessageBox]::Show($m, 'ffmpeg-Easy-Use · 初始化失败', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    } catch { }
+}
 function Yes($m) {
     if ($Force) { return $true }
     try { $a = Read-Host ("$m [Y/N]") } catch { return $false }
@@ -88,12 +96,115 @@ function Has-Tools([string]$dir) {
     return ((Test-Path -LiteralPath (Join-Path $dir 'ffmpeg.exe')) -and (Test-Path -LiteralPath (Join-Path $dir 'ffprobe.exe')))
 }
 
-function Download([string]$url, [string]$dest) {
-    $old = $ProgressPreference
-    $ProgressPreference = 'SilentlyContinue'
+# 找一个可用的 Python 解释器（探测硬件加速能力时需要）
+function Find-Python {
+    foreach ($n in @('python', 'python3')) {
+        try {
+            $c = Get-Command $n -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($c) {
+                $p = if ($c.Source) { $c.Source } else { $c.Path }
+                if ($p) { return ($p -replace '^\\\\\?\\', '') }
+            }
+        } catch { }
+    }
+    return ''
+}
+
+# 探测本机 NVENC 硬件加速能力并写入 core\capabilities.json（尽力而为，失败不影响初始化）
+function Collect-Capabilities {
+    $py = Find-Python
+    if (-not $py) {
+        Warn '未找到 python，跳过 GPU 硬件加速能力探测（首次启动压缩入口时会自动探测一次）。'
+        return
+    }
+    $vp = Join-Path $CoreDir 'vpipe.py'
+    if (-not (Test-Path -LiteralPath $vp)) { Warn "缺少 vpipe.py，跳过 GPU 能力探测"; return }
+    Info ''
+    Info '正在探测本机 GPU 硬件加速能力（NVENC）...'
+    $env:PYTHONIOENCODING = 'utf-8'
+    $oldEnc = $null
+    try { $oldEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
     try {
-        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -TimeoutSec 3600
-    } finally { $ProgressPreference = $old }
+        & $py $vp hwcaps --write
+        if ($LASTEXITCODE -ne 0) { Warn '硬件能力探测未成功（不影响初始化；首次启动压缩入口时会再探测一次）。' }
+    } catch {
+        Warn ('硬件能力探测异常: ' + $_.Exception.Message)
+    } finally {
+        if ($oldEnc) { try { [Console]::OutputEncoding = $oldEnc } catch { } }
+        Remove-Item Env:\PYTHONIOENCODING -ErrorAction SilentlyContinue
+    }
+}
+
+# 体积 / 速度 / 剩余时间的人类可读格式
+function Fmt-Size([double]$n) {
+    if ($n -ge 1GB) { return ('{0:N2} GB' -f ($n / 1GB)) }
+    if ($n -ge 1MB) { return ('{0:N1} MB' -f ($n / 1MB)) }
+    if ($n -ge 1KB) { return ('{0:N0} KB' -f ($n / 1KB)) }
+    return ('{0:N0} B' -f [math]::Round($n))
+}
+function Fmt-Speed([double]$bps) {
+    if ($bps -ge 1MB) { return ('{0:N2} MB/s' -f ($bps / 1MB)) }
+    if ($bps -ge 1KB) { return ('{0:N0} KB/s' -f ($bps / 1KB)) }
+    return ('{0:N0} B/s' -f [math]::Round($bps))
+}
+function Fmt-Eta([double]$sec) {
+    if ($sec -lt 0 -or [double]::IsNaN($sec) -or [double]::IsInfinity($sec)) { return '--:--' }
+    $s = [int][math]::Round($sec)
+    if ($s -ge 3600) { return ('{0}:{1:D2}:{2:D2}' -f [int]($s / 3600), [int](($s % 3600) / 60), ($s % 60)) }
+    return ('{0:D2}:{1:D2}' -f [int]($s / 60), ($s % 60))
+}
+
+# 边下边显示 进度条 / 已下载体积 / 实时速度 / 剩余时间。
+# 连接与单次读取各 30 秒超时：网络中断会立刻报错，而不是"卡在这里不动"。
+function Download([string]$url, [string]$dest) {
+    $req = [System.Net.HttpWebRequest]::Create($url)
+    $req.Method = 'GET'
+    $req.UserAgent = 'ffmpeg-Easy-Use/1.0'
+    $req.AllowAutoRedirect = $true
+    $req.Timeout = 30000
+    $req.ReadWriteTimeout = 30000
+    $resp = $null; $ns = $null; $fs = $null
+    try {
+        $resp = $req.GetResponse()
+        [long]$total = $resp.ContentLength
+        $ns = $resp.GetResponseStream()
+        $fs = [System.IO.File]::Create($dest)
+        $buf = New-Object byte[] (256KB)
+        [long]$got = 0
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastT = 0.0; [long]$lastB = 0
+        while ($true) {
+            $n = $ns.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { break }
+            $fs.Write($buf, 0, $n)
+            $got += $n
+            $el = $sw.Elapsed.TotalSeconds
+            if (($el - $lastT) -ge 0.5 -or (($total -gt 0) -and ($got -ge $total))) {
+                $inst = [double]($got - $lastB) / [math]::Max($el - $lastT, 0.001)
+                if ($total -gt 0) {
+                    $pct = [math]::Min(100.0, 100.0 * $got / $total)
+                    $filled = [int][math]::Floor($pct / 5)
+                    $bar = ('#' * $filled) + ('-' * (20 - $filled))
+                    $eta = if ($inst -gt 0) { ($total - $got) / $inst } else { [double]::PositiveInfinity }
+                    $line = '  [{0}] {1,5:N1}%  {2} / {3}  {4}  ETA {5}' -f $bar, $pct, (Fmt-Size $got), (Fmt-Size $total), (Fmt-Speed $inst), (Fmt-Eta $eta)
+                } else {
+                    $line = '  已下载 {0}   {1}' -f (Fmt-Size $got), (Fmt-Speed $inst)
+                }
+                Write-Host ("`r" + $line.PadRight(90)) -NoNewline
+                $lastT = $el; $lastB = $got
+            }
+        }
+        $fs.Flush()
+        $el = $sw.Elapsed.TotalSeconds
+        $avg = if ($el -gt 0) { $got / $el } else { 0 }
+        Write-Host ''
+        Good ('下载完成: ' + (Fmt-Size $got) + '，用时 ' + (Fmt-Eta $el) + '，平均 ' + (Fmt-Speed $avg))
+        if (($total -gt 0) -and ($got -ne $total)) { throw "下载不完整（收到 $got 字节，预期 $total 字节）" }
+    } finally {
+        if ($fs) { $fs.Dispose() }
+        if ($ns) { $ns.Dispose() }
+        if ($resp) { $resp.Dispose() }
+    }
 }
 
 # 解开 zip，把 ffmpeg/ffprobe/ffplay 三个 exe 拷进 destBin
@@ -182,7 +293,7 @@ if ($needFfmpeg) {
         $err = ''
         try {
             if ($FfmpegZip -match '^https?://') {
-                Info "下载中…（文件较大，请耐心等待）"
+                Info '下载中…（下方实时显示进度 / 速度）'
                 Download $FfmpegZip $zipPath
             } else {
                 Copy-Item -LiteralPath $FfmpegZip -Destination $zipPath -Force
@@ -194,19 +305,27 @@ if ($needFfmpeg) {
         if ($err) { Die "获取 ffmpeg 失败: $err" }
     } else {
         $ok = $false
-        foreach ($u in $ONLINE) {
-            $zipPath = Join-Path $env:TEMP ('ffmpeg_easyuse_' + (Get-Date -Format 'yyyyMMddHHmmss') + '.zip')
+        for ($i = 0; $i -lt $ONLINE.Count; $i++) {
+            $u = $ONLINE[$i]
+            $zipPath = Join-Path $env:TEMP ('ffmpeg_easyuse_' + (Get-Date -Format 'yyyyMMddHHmmss') + '_' + $i + '.zip')
             try {
-                Info "下载中（essentials 版，约 109 MB）: $u"
+                Info ("下载源 {0}/{1}: {2}" -f ($i + 1), $ONLINE.Count, $u)
                 Download $u $zipPath
+                Info '解压并安装…'
                 Install-FromZip $zipPath $BinDir $env:TEMP
                 $ok = $true
-            } catch { Warn ("该来源失败: " + $_.Exception.Message) } finally {
+            } catch {
+                Warn ("该来源失败: " + $_.Exception.Message)
+                if ($i -lt ($ONLINE.Count - 1)) { Info '改用备用源重试…' }
+            } finally {
                 Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
             }
             if ($ok) { break }
         }
-        if (-not $ok) { Die '自动下载 ffmpeg 失败（网络受限？）。可先用 -FfmpegZip 指定本地 zip，或手动把 ffmpeg.exe / ffprobe.exe 放到 ' + $BinDir + ' 后重试。' }
+        if (-not $ok) {
+            PopError ("自动下载 ffmpeg 失败（网络受限或下载被中断）。`r`n`r`n备用方案：`r`n  · 手动把 ffmpeg.exe / ffprobe.exe 放进`r`n    $BinDir`r`n  · 或用 -FfmpegZip 指定本地 zip 后重试")
+            Die ('自动下载 ffmpeg 失败：两个来源都无法获取 ffmpeg。可把 ffmpeg.exe / ffprobe.exe 手动放进 ' + $BinDir + '，或用 -FfmpegZip 指定本地 zip 后重试。')
+        }
     }
     $FfmpegDir = $BinDir
 }
@@ -240,6 +359,9 @@ $cfgText = Set-JsonStrField $cfgText 'ffmpeg_dir' $FfmpegDir
 
 try { $null = (Get-Content -LiteralPath $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
 catch { Warn "写入后的 config.json 校验失败，请检查: $CfgPath" }
+
+# ---------- 3.5 探测本机 GPU 硬件加速能力（写 core\capabilities.json，供压缩入口灰显不支持档位） ----------
+Collect-Capabilities
 
 # ---------- 4. 完成 ----------
 Info ''

@@ -72,6 +72,27 @@ NEW_GROUP = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
 NVENC = ('h264_nvenc', 'hevc_nvenc', 'av1_nvenc')
 
 
+def profile_availability(enc, enc_ok, reasons):
+    """档位是否可在本机使用。仅对 NVENC 编码器做判定；探测未知（enc_ok 为空）时不阻断。
+    返回 (available, 不可用原因)。"""
+    if enc not in NVENC or not enc_ok:
+        return True, ''
+    if enc_ok.get(enc):
+        return True, ''
+    return False, (reasons.get(enc) or '本机未检测到可用的 NVIDIA 显卡/驱动')
+
+
+def detect_hw_caps(cfg):
+    """启动时确定本机硬件能力（优先读 core/capabilities.json，缺失则现场探测）。
+    探测不可用（如未配置 ffmpeg）时返回 None，表示「未知」，不阻断任何档位。"""
+    try:
+        return vpipe.resolve_hw_caps(vpipe.tools_from_cfg(cfg))
+    except SystemExit:
+        return None
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
 # ---------------------------------------------------------------- 基础工具
 def now_str():
     return time.strftime('%Y-%m-%d %H:%M:%S')
@@ -651,6 +672,7 @@ class State:
         self.runner = Runner()
         self.runner.on_finish = self._on_runner_finish   # 任务结束后清理已处理的待处理路径
         self.httpd = None
+        self.hw = detect_hw_caps(cfg)                    # 本机硬件能力（None=未知，不阻断档位）
         # 启动时自动加载脚本目录下的示例预设文件（若有）
         p = os.path.join(HERE, DEFAULT_PRESET_FILE)
         if os.path.isfile(p):
@@ -708,29 +730,56 @@ class State:
             self.base_path = path
         return True
 
+    def start_job(self, req):
+        """启动前预检：所选档位的编码器在本机是否可用，避免无意义地起进程再逐个文件失败。
+        注意 --no-gpu 只关闭 NVDEC/CUDA 解码，NVENC 档位的编码器依旧是 NVENC，故照旧校验。"""
+        name = req.get('profile') or self.base_cfg.get('default_profile') or ''
+        prof = (self.base_cfg.get('profiles') or {}).get(name) or {}
+        enc = (((req.get('options') or {}).get('encoder') or prof.get('encoder') or '')).strip()
+        avail, why = profile_availability(enc, (self.hw or {}).get('encoders') or {},
+                                          (self.hw or {}).get('reasons') or {})
+        if not avail:
+            return False, ("档位「%s」需要 %s（NVIDIA 硬件编码器），但本机探测到该编码器不可用：%s\n"
+                           "请改用软件档位（如 x265 / x264），或换到具备 NVIDIA 显卡的机器。"
+                           % (name, enc, why))
+        return self.runner.start(self.base_cfg, req)
+
     def payload(self):
         cfg = self.base_cfg
+        enc_ok = (self.hw or {}).get('encoders') or {}
+        reasons = (self.hw or {}).get('reasons') or {}
         profiles = []
         for name, p in (cfg.get('profiles') or {}).items():
+            enc = p.get('encoder') or ''
+            avail, why = profile_availability(enc, enc_ok, reasons)
             profiles.append({
                 'name': name,
                 'tag': p.get('tag') or name,
                 'description': p.get('description') or '',
-                'encoder': p.get('encoder') or '',
+                'encoder': enc,
                 'vparams': p.get('vparams') or [],
                 'pix_fmt': p.get('pix_fmt') or 'yuv420p',
                 'audio_mode': p.get('audio_mode') or 'copy',
                 'audio_bitrate': p.get('audio_bitrate') or '160k',
                 'container': p.get('container') or 'mp4',
+                'available': avail,
+                'unavailable_reason': why,
             })
         presets = list(BUILTIN_PRESETS)
         presets += [dict(x, from_file=True, path=self.file_preset_path)
                     for x in self.file_presets]
+        default = cfg.get('default_profile') or (profiles[0]['name'] if profiles else '')
+        by_name = {p['name']: p for p in profiles}
+        if by_name.get(default, {}).get('available') is False:
+            # 默认档位在本机不可用：回落到可用档位（优先软件档位，避免一开页面就选中灰档）
+            soft = [p['name'] for p in profiles if p['available'] and p['encoder'] not in NVENC]
+            avail = [p['name'] for p in profiles if p['available']]
+            default = (soft or avail or [default])[0]
         with self.lock:
             paths = list(self.paths)
         return {
             'config_path': self.base_path,
-            'default_profile': cfg.get('default_profile') or (profiles[0]['name'] if profiles else ''),
+            'default_profile': default,
             'profiles': profiles,
             'presets': presets,
             'resolution': cfg.get('resolution') or {},
@@ -738,6 +787,14 @@ class State:
             'review_enabled': bool(cfg.get('review_enabled', True)),
             'preset_file': self.file_preset_path,
             'paths': paths,
+            'hwcaps': {
+                'probed': bool(self.hw),
+                'cuda': bool((self.hw or {}).get('cuda')),
+                'encoders': enc_ok,
+                'reasons': reasons,
+                'probed_at': (self.hw or {}).get('probed_at') or '',
+                'summary': vpipe.hw_caps_summary(self.hw),
+            },
         }
 
 
@@ -895,7 +952,7 @@ class Handler(BaseHTTPRequestHandler):
         data = self._body()
 
         if p == '/api/start':
-            ok, info = st.runner.start(st.base_cfg, data)
+            ok, info = st.start_job(data)
             if not ok:
                 code = 409 if '正在运行' in info else 400
                 return self._json({'error': info}, code)
@@ -1188,6 +1245,7 @@ def _run(args):
     url = 'http://127.0.0.1:%d/' % real_port
     vpipe.log("压缩入口已就绪: " + url)
     vpipe.log("当前配置: %s" % st.base_path)
+    vpipe.log("硬件加速: %s" % vpipe.hw_caps_summary(st.hw))
     vpipe.log("已加入 %d 个路径；在页面上选好档位与参数后点「开始压缩」。" % len(st.paths))
     vpipe.log("按 Ctrl+C 关闭服务（或执行 python compress_gui.py --stop）。")
 

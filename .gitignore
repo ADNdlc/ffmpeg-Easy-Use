@@ -5,6 +5,9 @@ _work/
 # 初始化时就地生成的用户配置（模板见 core/config.example.json）
 core/config.json
 
+# 初始化/启动时探测本机硬件能力生成的快照（每台机器不同，不入库）
+core/capabilities.json
+
 # 自动下载到仓库内的 ffmpeg
 bin/
 

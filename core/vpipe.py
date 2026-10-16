@@ -1152,6 +1152,178 @@ def gpu_fatal_find(tail):
     return None
 
 
+# ---------------------------------------------------------------- 硬件能力探测（NVENC）
+# 本机是否真能用 NVENC，只有「真起一次编码」才靠谱：缺驱动、显卡太老、ffmpeg 未编译该编码器
+# 都会让初始化失败。初始化脚本会跑一次探测并把结果写进 core/capabilities.json；这里再提供
+# 读取 / 现场探测 / 校验的公共实现，供 GUI 与 CLI 复用，避免无意义地起任务再逐个文件失败。
+CAPS_NAME = 'capabilities.json'
+CAPS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), CAPS_NAME)
+CAPS_VERSION = 1
+_HW_CAPS_CACHE = None
+
+
+def _probe_encoder(ffmpeg, enc):
+    """用极短的合成源试编码，判定该 NVENC 编码器能否在本机真正初始化。
+    返回 (可用, 不可用原因)；rc=0 视为可用。"""
+    cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error',
+           '-f', 'lavfi', '-i', 'testsrc=size=256x256:rate=1:duration=0.2',
+           '-frames:v', '1', '-pix_fmt', 'yuv420p', '-c:v', enc, '-f', 'null', '-']
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30)
+    except subprocess.TimeoutExpired:
+        return False, '探测超时（30 秒）'
+    except OSError as e:
+        return False, '无法执行 ffmpeg: %s' % e
+    if p.returncode == 0:
+        return True, ''
+    lines = [l.strip() for l in (p.stderr or b'').decode('utf-8', 'replace').splitlines() if l.strip()]
+    return False, (lines[-1][:160] if lines else 'ffmpeg 退出码 %s' % p.returncode)
+
+
+def probe_hw_caps(tools):
+    """逐一对 NVENC 编码器做真实试编码，返回能力快照 dict。"""
+    encoders, reasons = {}, {}
+    for enc in NVIDIA_ENCODERS:
+        ok, why = _probe_encoder(tools['ffmpeg'], enc)
+        encoders[enc] = ok
+        if not ok:
+            reasons[enc] = why
+    return {
+        'version': CAPS_VERSION,
+        'probed_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'ffmpeg': tools.get('ffmpeg') or '',
+        'encoders': encoders,
+        'reasons': reasons,
+        # NVDEC/CUDA 与 NVENC 共用 nvcuda.dll 这道门槛：任一 NVENC 可用即认为 GPU 管线可用
+        'cuda': any(encoders.values()),
+    }
+
+
+def load_hw_caps(tools=None):
+    """读取 core/capabilities.json；版本不符、字段缺失或 ffmpeg 已换（路径不同）则视为无效。"""
+    try:
+        with open(CAPS_PATH, 'r', encoding='utf-8-sig') as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(d, dict) or d.get('version') != CAPS_VERSION:
+        return None
+    if not isinstance(d.get('encoders'), dict):
+        return None
+    if tools and d.get('ffmpeg') and d['ffmpeg'] != tools.get('ffmpeg'):
+        return None
+    return d
+
+
+def save_hw_caps(caps):
+    """原子写入能力快照（失败仅告警，探测结果仍可继续用于本次运行）。"""
+    try:
+        d = os.path.dirname(CAPS_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = '%s.part.%d' % (CAPS_PATH, os.getpid())
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(caps, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CAPS_PATH)
+        return True
+    except OSError as e:
+        log("警告: 无法写入硬件能力快照 %s（%s）" % (CAPS_PATH, e))
+        return False
+
+
+def resolve_hw_caps(tools, refresh=False):
+    """取本机硬件能力：优先用初始化阶段写好的 capabilities.json，缺失/失效则现场探测。
+    进程内缓存，避免一次运行里重复探测。探测失败返回 None（表示「未知」，调用方不应据此阻断）。"""
+    global _HW_CAPS_CACHE
+    if _HW_CAPS_CACHE is not None and not refresh:
+        return _HW_CAPS_CACHE
+    caps = None if refresh else load_hw_caps(tools)
+    if caps is None:
+        try:
+            caps = probe_hw_caps(tools)
+        except Exception as e:                                    # noqa: BLE001
+            log("警告: 硬件能力探测失败（%s），本次跳过硬件支持性校验。" % e)
+            return None
+    _HW_CAPS_CACHE = caps
+    return caps
+
+
+def hw_caps_summary(caps):
+    """把能力快照拼成一行人类可读摘要。"""
+    if not caps:
+        return '未探测（硬件支持性校验已跳过）'
+    enc = caps.get('encoders') or {}
+    ok = [k for k in NVIDIA_ENCODERS if enc.get(k)]
+    bad = [k for k in NVIDIA_ENCODERS if not enc.get(k)]
+    s = 'NVENC 可用: %s' % ('/'.join(ok) if ok else '无')
+    if bad:
+        s += '；不可用: %s' % '/'.join(bad)
+    s += '；GPU 解码(NVDEC/CUDA): %s' % ('可用' if caps.get('cuda') else '不可用')
+    return s
+
+
+def hw_pipeline_ok(tools):
+    """本机是否值得尝试 NVDEC/CUDA 管线（未知时按可用处理，保持既有行为）。"""
+    caps = resolve_hw_caps(tools)
+    return True if not caps else bool(caps.get('cuda'))
+
+
+def gpu_status_line(cfg, args, tools):
+    """返回 (初始是否可尝试 GPU, 状态说明)。说明用于任务开始时的日志；初始标记用于候选筛选，
+    这样在「本机无可用 GPU」时可直接跳过 NVDEC/CUDA，不做无意义的尝试。"""
+    if not gpu_enabled(cfg, args):
+        return False, "已关闭（纯软件）"
+    if not hw_pipeline_ok(tools):
+        return False, "本机无可用 GPU（NVDEC/CUDA），使用纯软件"
+    return True, "启用（优先 NVDEC/CUDA，失败自动降级）"
+
+
+def check_profile_hw(cfg, profile, prof_name, tools, force=False):
+    """编码前的硬件支持性预检：档位用 NVENC 但本机不可用时直接拒绝并给出指引，
+    避免起了任务却每个文件都白试一遍；force 时仅告警仍继续。
+    注意：即便用户关闭了 GPU 加速（--no-gpu / gpu.enabled=false），NVENC 档位的编码器
+    依旧是 NVENC（只是不再用 NVDEC 解码），因此这里必须照旧校验。"""
+    enc = profile.get('encoder') or ''
+    if enc not in NVIDIA_ENCODERS:
+        return True
+    caps = resolve_hw_caps(tools)
+    if not caps or (caps.get('encoders') or {}).get(enc):
+        return True
+    why = (caps.get('reasons') or {}).get(enc) or '本机未检测到可用的 NVIDIA 显卡/驱动'
+    if force:
+        log("警告: 档位「%s」需要 %s（NVIDIA 硬件编码器），但本机探测不可用（%s）。"
+            % (prof_name, enc, why))
+        log("      已按 --force-hw 强制继续；编码很可能全部失败，失败后请改用软件档位。")
+        return True
+    die("档位「%s」使用 %s 编码，但本机探测到该编码器不可用：%s\n"
+        "  本机没有可用的 NVIDIA 显卡/驱动，或显卡型号/驱动版本不支持该编码器。\n"
+        "  请选择软件档位（如 hevc_x265_hq / h264_x264），或换到具备 NVIDIA 显卡的机器；\n"
+        "  确需强行尝试请加 --force-hw（预计会失败，仅用于排查）。" % (prof_name, enc, why))
+
+
+def cmd_hwcaps(args):
+    """探测本机 NVENC 硬件加速能力；--write 写入 core/capabilities.json，--json 打印 JSON。"""
+    cfg = load_config(args.config)
+    tools = tools_from_cfg(cfg)
+    caps = probe_hw_caps(tools)
+    if args.write:
+        save_hw_caps(caps)
+    if args.json:
+        out = dict(caps)
+        out['summary'] = hw_caps_summary(caps)
+        log(json.dumps(out, ensure_ascii=False, indent=2))
+        return EXIT_OK
+    log("本机硬件加速探测结果：")
+    for enc in NVIDIA_ENCODERS:
+        ok = caps['encoders'].get(enc)
+        log("  %-11s : %s" % (enc, '支持' if ok else '不支持（%s）'
+                              % (caps['reasons'].get(enc) or '未知')))
+    log("  GPU 解码(NVDEC/CUDA) : %s" % ('支持' if caps.get('cuda') else '不支持'))
+    if args.write:
+        log("已写入: %s" % CAPS_PATH)
+    return EXIT_OK
+
+
 def build_encode_cmd(tools, profile, res, rec, out_path, hw=None, force_aac=False):
     """hw: None=纯软件；'cuda-full'=NVDEC 解码 + CUDA 缩放 + GPU 编码；'cuda-decode'=仅 NVDEC 解码。
     cuda-full 时输入帧即为 CUDA 显存帧，滤镜必须用 CUDA 版，且不能指定软件侧 pix_fmt。
@@ -1643,7 +1815,8 @@ def run_encode_with_fallback(tools, profile, res, rec, part, duration, logfile, 
     """按候选加速模式依次尝试（GPU 优先，失败自动降级），末位为纯软件兜底。
     返回 (returncode, err_tail, 实际使用的模式, timed_out)。
     * 每次尝试前清掉上一次留下的同名中间文件。
-    * 若失败命中「GPU 整体不可用」关键字，则本次运行内停用后续 GPU 候选。
+    * 若失败命中「GPU 整体不可用」关键字，则本次运行内停用后续 GPU 候选，但仍会继续
+      尝试更后面的纯软件候选（不能 break——否则会连软件兜底一起丢掉）。
     * 看门狗超时属「与加速模式无关」的失败，直接停止降级重试，避免成倍耗时。
     * 音轨 copy 与封装不兼容时（写头部即失败），用 AAC 重试一次（改用纯软件，与加速模式无关）。"""
     last_rc, last_tail, timed = None, '', False
@@ -1653,6 +1826,8 @@ def run_encode_with_fallback(tools, profile, res, rec, part, duration, logfile, 
         for i, mode in enumerate(modes):
             if CANCELLED:
                 return last_rc, last_tail, None, timed
+            if mode is not None and gpu_state is not None and not gpu_state.get('gpu'):
+                continue        # 本机 GPU 已判定不可用：跳过剩余 GPU 候选，直接落到纯软件兜底
             _remove_quiet(part)
             if i > 0:
                 log("    改用%s重试 ..." % describe_hw(mode))
@@ -1672,7 +1847,7 @@ def run_encode_with_fallback(tools, profile, res, rec, part, duration, logfile, 
                 if mk:
                     gpu_state['gpu'] = False
                     log("    提示: 检测到 GPU/CUDA 不可用（%s），本次运行后续文件改用纯软件路径。" % mk)
-                    break
+                    continue
         if CANCELLED:
             return last_rc, last_tail, None, timed
         if (not audio_retry and (profile.get('audio_mode') or 'copy') == 'copy'
@@ -1690,6 +1865,7 @@ def cmd_encode(args):
     cfg = load_config(args.config)
     tools = tools_from_cfg(cfg)
     prof_name, profile = pick_profile(cfg, args.profile)
+    check_profile_hw(cfg, profile, prof_name, tools, force=getattr(args, 'force_hw', False))
     res = resolve_resolution(cfg, args)
 
     mode = cfg.get('output_mode', 'samedir')
@@ -1704,7 +1880,7 @@ def cmd_encode(args):
     inv = load_inventory(work)
 
     src_dir = os.path.abspath(inv['input_dir'])
-    log("GPU 加速: %s" % ("启用（优先 NVDEC/CUDA，失败自动降级）" if gpu_enabled(cfg, args) else "已关闭（纯软件）"))
+    log("GPU 加速: %s" % gpu_status_line(cfg, args, tools)[1])
     if mode == 'samedir':
         log("输出方式: 写入源文件同目录，命名加 _%s 后缀（源文件不会被改动）" % (profile.get('tag') or prof_name))
         log("分辨率: %s" % describe_resolution(res))
@@ -1750,7 +1926,7 @@ def cmd_encode(args):
 
     done = err = skipped = 0
     interrupted = False
-    gpu_state = {'gpu': True}   # 本次运行内是否仍可尝试 GPU（命中全局性 GPU 故障后置为 False）
+    gpu_state = {'gpu': gpu_status_line(cfg, args, tools)[0]}   # 本次运行内是否仍可尝试 GPU
     rv_keys = filtered_keys(work) if (review_enabled(cfg) and not args.include_filtered) else set()
     t0 = time.time()
     for i, rec in enumerate(todo, 1):
@@ -2031,6 +2207,7 @@ def drag_single_workspace(args):
     cfg = load_config(args.config)
     tools = tools_from_cfg(cfg)
     prof_name, profile = pick_profile(cfg, args.profile)
+    check_profile_hw(cfg, profile, prof_name, tools, force=getattr(args, 'force_hw', False))
     res = resolve_resolution(cfg, args)
 
     ws = args.work
@@ -2058,7 +2235,7 @@ def drag_single_workspace(args):
 
     log("profile = %s" % prof_name)
     log("说明: %s" % profile.get('description', ''))
-    log("GPU 加速: %s" % ("启用（优先 NVDEC/CUDA，失败自动降级）" if gpu_enabled(cfg, args) else "已关闭（纯软件）"))
+    log("GPU 加速: %s" % gpu_status_line(cfg, args, tools)[1])
     log("分辨率: %s" % describe_resolution(res))
     log("输出: 写入源文件同目录，命名加 _%s 后缀（源文件不会被改动）" % (profile.get('tag') or prof_name))
     log("工作区: %s（报告与审阅入口在根目录，日志/json 在 .data）" % ws)
@@ -2066,7 +2243,7 @@ def drag_single_workspace(args):
 
     results = []
     interrupted = False
-    gpu_state = {'gpu': True}   # 本次运行内是否仍可尝试 GPU（命中全局性 GPU 故障后置为 False）
+    gpu_state = {'gpu': gpu_status_line(cfg, args, tools)[0]}   # 本次运行内是否仍可尝试 GPU
     for i, f in enumerate(files, 1):
         if CANCELLED:
             interrupted = True
@@ -2222,6 +2399,12 @@ def _add_gpu_arg(p):
                    help='禁用 GPU 加速（NVDEC/CUDA），强制走纯软件解码与缩放')
 
 
+def _add_hw_force_arg(p):
+    """给子命令加上「硬件不支持也强行继续」开关（默认关闭，仅用于排查）。"""
+    p.add_argument('--force-hw', action='store_true',
+                   help='所选档位的 NVENC 编码器在本机不可用时仍然继续（预计会失败，仅用于排查）')
+
+
 def main():
     ensure_utf8()
     _init_job_object()
@@ -2259,7 +2442,14 @@ def main():
                    help='忽略审阅过滤器，强制处理被标记为「不需要转换」的文件')
     _add_resolution_args(p)
     _add_gpu_arg(p)
+    _add_hw_force_arg(p)
     p.set_defaults(func=cmd_encode)
+
+    p = sub.add_parser('hwcaps', help='探测本机 NVENC 硬件加速能力（供初始化/GUI 使用）')
+    p.add_argument('--write', action='store_true',
+                   help='把探测结果写入 core/capabilities.json')
+    p.add_argument('--json', action='store_true', help='以 JSON 输出（便于脚本解析）')
+    p.set_defaults(func=cmd_hwcaps)
 
     p = sub.add_parser('report', help='生成压缩对比报告')
     p.add_argument('--profile', default=None)
@@ -2287,6 +2477,7 @@ def main():
                    help='忽略审阅过滤器，强制处理被标记为「不需要转换」的文件')
     _add_resolution_args(p)
     _add_gpu_arg(p)
+    _add_hw_force_arg(p)
     p.set_defaults(func=cmd_drag)
 
     args = ap.parse_args()
