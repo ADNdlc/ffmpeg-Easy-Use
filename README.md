@@ -99,6 +99,7 @@
 - 点「汇总」列出删除清单与保留清单，确认后统一执行；执行前逐项校验，文件已被改动或消失的项会跳过并说明原因。
 - 删除某个源、而该组已无任何保留结果时，要求**显式确认**，避免把一组删成空壳。
 - 不想要审阅功能：`config.json` 里设 `"review_enabled": false`。状态在 `<目标目录>\.data\review.json`，原子写入，损坏会自动备份并重建。
+- **用完即走**：服务的存活以「页面是否在活动」为准。关掉审阅页面后，超过 `review_idle_timeout_min`（默认 10 分钟，`0` = 禁用）没有任何请求就自动退出，不会留下看不见的驻留进程；页面开着期间（哪怕切到后台）会持续心跳保活。想立刻关掉，点页面右上角「关闭服务」，或在命令行跑 `review.py --stop`。
 
 ## 命令行（可选）
 
@@ -119,6 +120,7 @@ python vpipe.py encode --profile hevc_nvenc           # 编码，断点续跑；
 python vpipe.py report --profile hevc_nvenc --quality # 出报告，附带 SSIM/PSNR
 
 python review.py --work "D:\videos\目录"              # 审阅服务，review.py --stop 关闭
+python review.py --work "D:\videos\目录" --idle-timeout 0   # 关闭空闲自动退出（默认 10 分钟）
 ```
 
 ## 目录结构（仓库）

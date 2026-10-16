@@ -21,7 +21,14 @@ review.py —— vpipe 人工审阅服务（本地单页）
   python review.py --work <目录>   # 指定工作区（源目录与 .data 都取自该目录）
   python review.py --no-browser    # 只起服务，不自动开浏览器
   python review.py --rescan        # 启动前重新扫描源目录
+  python review.py --idle-timeout 10   # 空闲 10 分钟后自动关闭（0=禁用）
   python review.py --stop          # 关闭已运行的实例
+
+生命周期
+  * 服务以「页面是否还在活动」为存活依据：页面打开期间任何请求都会刷新活动时间，
+    页面关闭后超过空闲阈值（config.review_idle_timeout_min，默认 10 分钟，0=禁用）
+    即自动优雅退出（复用 /api/shutdown 同款清理路径）。
+    这样无论由「审阅.bat」还是压缩页面拉起，都不会留下无页面、无窗口的隐蔽驻留进程。
 
 退出码：0=正常；1=运行期错误；2=参数/配置错误
 """
@@ -667,6 +674,11 @@ class ServerState(object):
         self.queue = None
         self.tokens = {}
         self.httpd = None
+        self.last_activity = time.time()   # 最近一次页面活动；空闲看门狗据此判断是否仍需存活
+
+    def touch(self):
+        """记录一次「页面活动」（任意请求入口调用）；空闲看门狗据此续期。"""
+        self.last_activity = time.time()
 
     def rebuild(self):
         """只重算分组/令牌（不跑 ffprobe），用于开关变更后刷新队列。"""
@@ -793,6 +805,7 @@ class Handler(BaseHTTPRequestHandler):
         self._route(head_only=True)
 
     def _route(self, head_only):
+        self.server.state.touch()          # 任何请求都算「页面还在用」，为空闲看门狗续期
         u = urllib.parse.urlparse(self.path)
         p = u.path
         if p in ('/', '/index.html'):
@@ -872,6 +885,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- POST
     def do_POST(self):
+        self.server.state.touch()          # 写操作同样续期（页面在交互）
         if not self._origin_ok():
             return self._json({'error': '拒绝跨站请求'}, 403)
         u = urllib.parse.urlparse(self.path)
@@ -937,6 +951,33 @@ class Handler(BaseHTTPRequestHandler):
         return self._text(404, '未找到: ' + p)
 
 
+# ---------------------------------------------------------------- 空闲看门狗
+DEFAULT_IDLE_MIN = 10         # 分钟；页面关闭后多久自动退出（0=禁用）
+IDLE_CHECK_MAX = 30.0         # 看门狗最长检查间隔（秒）；阈值更短时自动缩短，便于测试
+
+
+def _watch_idle(httpd, timeout_sec):
+    """空闲看门狗：把「服务存活」绑定到「页面是否在活动」。
+
+    Handler 在每个请求入口刷新 httpd.state.last_activity；页面关闭后不再有任何请求，
+    超过 timeout_sec 秒即主动调用 httpd.shutdown()，走与 /api/shutdown / Ctrl+C 相同的
+    清理路径（关闭监听、删除端口文件、返回 0）。因此「审阅.bat 拉起 / 压缩页面拉起 /
+    父进程被强杀」三条路径最终都会收敛，不会留下无页面、无窗口的隐蔽驻留进程。
+    """
+    step = max(1.0, min(IDLE_CHECK_MAX, float(timeout_sec)))
+    while True:
+        time.sleep(step)
+        try:
+            idle = time.time() - httpd.state.last_activity
+        except Exception:                                     # noqa: BLE001
+            return
+        if idle > timeout_sec:
+            vpipe.log("审阅服务空闲 %.1f 分钟无页面活动（阈值 %.1f 分钟），自动关闭。"
+                      % (idle / 60.0, timeout_sec / 60.0))
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+            return
+
+
 # ---------------------------------------------------------------- 单实例 / 入口
 def port_path(work):
     return os.path.join(work, PORT_NAME)
@@ -998,6 +1039,9 @@ def _parse_args():
     ap.add_argument('--rescan', action='store_true', help='启动前重新扫描源目录')
     ap.add_argument('--no-browser', action='store_true', help='只起服务，不自动打开浏览器')
     ap.add_argument('--stop', action='store_true', help='关闭正在运行的审阅服务')
+    ap.add_argument('--idle-timeout', type=float, default=None, metavar='MIN',
+                    help='页面关闭后空闲多少分钟自动关闭服务（0=禁用）；'
+                         '默认取 config.review_idle_timeout_min（默认 %d）' % DEFAULT_IDLE_MIN)
     ap.add_argument('--debug', action='store_true', help='出错时保留完整异常堆栈')
     return ap.parse_args()
 
@@ -1070,7 +1114,18 @@ def _run(args):
         len(st.queue['groups']), prog['total'], prog['checked'], prog['unreviewed_groups']))
     if bat:
         vpipe.log("快捷入口: %s（可重复双击）" % bat)
-    vpipe.log("按 Ctrl+C 关闭服务（或双击入口执行 review.py --stop）。")
+    vpipe.log("按 Ctrl+C、页面「关闭服务」或 review.py --stop 结束；页面关闭后超时会自动退出。")
+
+    idle_min = args.idle_timeout
+    if idle_min is None:
+        idle_min = vpipe.to_int(cfg.get('review_idle_timeout_min'), DEFAULT_IDLE_MIN)
+    idle_sec = max(0.0, float(idle_min) * 60.0)
+    if idle_sec > 0:
+        threading.Thread(target=_watch_idle, args=(httpd, idle_sec), daemon=True).start()
+        vpipe.log("空闲保护：页面关闭后 %.1f 分钟无活动将自动关闭服务"
+                  "（config.review_idle_timeout_min / --idle-timeout，0=禁用）。" % (idle_sec / 60.0))
+    else:
+        vpipe.log("空闲自动退出已禁用（--idle-timeout 0）。")
 
     if not args.no_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()

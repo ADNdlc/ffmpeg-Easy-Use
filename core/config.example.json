@@ -11,6 +11,7 @@
 
   "review_enabled": true,
   "review_page_port": 0,
+  "review_idle_timeout_min": 10,
 
   "gpu": {
     "enabled": true

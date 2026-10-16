@@ -649,6 +649,13 @@
 
   window.addEventListener('beforeunload', function(){ try { vSrc.pause(); vRes.pause(); } catch(e){} });
 
+  // 心跳：页面存在期间定期告知服务端「仍在活动」，页面关闭后服务端按空闲阈值自动退出，
+  // 从而无论由「审阅.bat」还是压缩页面拉起，都不会留下无页面、无窗口的隐蔽驻留进程。
+  function heartbeat(){ fetch('/api/ping', {cache:'no-store'}).catch(function(){}); }
+  heartbeat();
+  setInterval(heartbeat, 30000);
+  document.addEventListener('visibilitychange', function(){ if (!document.hidden) heartbeat(); });
+
   document.addEventListener('keydown', function(e){
     var k = e.key;
     if ((e.ctrlKey || e.metaKey) && (k === 'z' || k === 'Z')){ e.preventDefault(); undo(); return; }
