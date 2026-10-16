@@ -14,7 +14,7 @@
   *{box-sizing:border-box;}
   body{margin:0; background:var(--bg); color:var(--fg); font-size:14px; line-height:1.6;
        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}
-  .wrap{max-width:1080px; margin:0 auto; padding:14px 16px 40px;}
+  .wrap{max-width:1200px; margin:0 auto; padding:14px 16px 40px;}
   header{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; padding-bottom:10px;
          border-bottom:1px solid var(--line); margin-bottom:14px;}
   h1{font-size:17px; margin:0;}
@@ -132,7 +132,7 @@
         <input type="range" id="quality" min="0" max="51" step="1">
       </div>
       <div class="fld">
-        <label title="preset 只影响编码速度与压缩效率（越慢，同画质下体积越小），不改变画质目标——画质由上面的「画质」滑杆决定。">速度 preset（越慢体积越小，不影响画质）</label>
+        <label title="preset 只影响编码速度与压缩效率（越慢，同画质下体积越小），不改变画质目标——画质由上面的「画质」滑杆决定。">速度 preset（不影响画质）</label>
         <select id="preset"></select>
       </div>
       <div class="fld">
@@ -292,6 +292,16 @@ function presetOptionsFor(p){
   if (/(_nvenc)$/.test(enc)) return ["p1","p2","p3","p4","p5","p6","p7"];
   return ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"];
 }
+function presetDescFor(enc, o){
+  var m = /(_nvenc)$/.test(enc || "")
+    ? {p1:"最快，体积最大", p2:"很快，体积较大", p3:"较快，体积略大", p4:"均衡",
+       p5:"较慢，体积较小", p6:"慢，体积更小", p7:"最慢，体积最小"}
+    : {ultrafast:"最快，体积最大", superfast:"很快，体积较大", veryfast:"快，体积略大",
+       faster:"较快", fast:"较快", medium:"均衡", slow:"较慢，体积较小",
+       slower:"更慢，体积更小", veryslow:"最慢，体积最小"};
+  var d = m[o];
+  return d ? o + "（" + d + "）" : o;
+}
 
 function renderCards(){
   var box = $("cards");
@@ -316,7 +326,7 @@ function selectProfile(name){
   var sel = $("preset");
   sel.innerHTML = "";
   presetOptionsFor(p).forEach(function(o){
-    var op = document.createElement("option"); op.value = o; op.textContent = o;
+    var op = document.createElement("option"); op.value = o; op.textContent = presetDescFor((p && p.encoder) || "", o);
     if (o === cur.preset) op.selected = true;
     sel.appendChild(op);
   });
