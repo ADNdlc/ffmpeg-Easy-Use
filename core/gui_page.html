@@ -33,6 +33,7 @@
     border:1px solid var(--line2); border-radius:6px; padding:5px 8px;}
   textarea{width:100%; min-height:52px; resize:vertical; font-family:var(--mono); font-size:12.5px;}
   input[type=text]{min-width:180px;}
+  input[type=text].path-in{flex:1 1 380px; min-width:360px;}
   input:focus,select:focus,textarea:focus{outline:none; border-color:var(--brand);}
   input[type=range]{accent-color:var(--brand); width:180px; vertical-align:middle;}
   button{font-family:inherit; font-size:12.5px; color:var(--fg); background:var(--panel2);
@@ -131,7 +132,7 @@
         <input type="range" id="quality" min="0" max="51" step="1">
       </div>
       <div class="fld">
-        <label>速度 preset</label>
+        <label title="preset 只影响编码速度与压缩效率（越慢，同画质下体积越小），不改变画质目标——画质由上面的「画质」滑杆决定。">速度 preset（越慢体积越小，不影响画质）</label>
         <select id="preset"></select>
       </div>
       <div class="fld">
@@ -188,7 +189,7 @@
       <select id="presetList" style="min-width:260px;"></select>
       <button id="btnApplyPreset">应用预设</button>
       <button id="btnPick">从文件加载…（对话选择）</button>
-      <input type="text" id="presetPath" placeholder="或手动填写预设/配置路径，如 D:\我的_config.json">
+      <input type="text" id="presetPath" class="path-in" title="或手动填写预设/配置路径，如 D:\我的_config.json" placeholder="或手动填写预设/配置路径，如 D:\我的_config.json">
       <button class="ghost" id="btnLoadPath">按路径加载</button>
     </div>
     <div class="msg" id="presetMsg"></div>
@@ -232,7 +233,7 @@
         <label class="chk"><input type="checkbox" id="fQuality"> 计算画质指标（SSIM/PSNR，较慢）</label>
       </div>
       <div class="row">
-        <input type="text" id="savePath" placeholder="另存为预设的路径，如 D:\我的预设_config.json">
+        <input type="text" id="savePath" class="path-in" title="另存为预设的路径，如 D:\我的预设_config.json" placeholder="另存为预设的路径，如 D:\我的预设_config.json">
         <button class="ghost" id="btnSavePreset">另存为预设</button>
       </div>
     </div>
