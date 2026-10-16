@@ -1,0 +1,80 @@
+{
+  "ffmpeg_dir": "",
+  "input_dir": "",
+  "output_mode": "samedir",
+  "output_ext": ".mp4",
+  "output_dir": "",
+  "default_profile": "hevc_nvenc",
+  "skip_efficient_codecs": ["hevc", "av1"],
+  "skip_bitrate_kbps": 6000,
+
+  "review_enabled": true,
+  "review_page_port": 0,
+  "review_idle_timeout_min": 10,
+
+  "gpu": {
+    "enabled": true
+  },
+
+  "resolution": {
+    "max_long_side": 0,
+    "max_fps": 0
+  },
+
+  "profiles": {
+    "hevc_nvenc": {
+      "tag": "hevc",
+      "description": "默认：NVENC HEVC 恒定质量 CQ28。速度极快，体积大幅下降，画质好。",
+      "encoder": "hevc_nvenc",
+      "vparams": ["-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", "28", "-b:v", "0",
+                  "-spatial-aq", "1", "-temporal-aq", "1", "-multipass", "fullres", "-rc-lookahead", "32"],
+      "pix_fmt": "yuv420p",
+      "audio_mode": "copy",
+      "audio_bitrate": "160k",
+      "container": "mp4"
+    },
+    "hevc_nvenc_hq": {
+      "tag": "hevcHQ",
+      "description": "NVENC HEVC 高质量档：CQ24，p7，更慢但更小/更好，适合作为最终归档。",
+      "encoder": "hevc_nvenc",
+      "vparams": ["-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", "24", "-b:v", "0",
+                  "-spatial-aq", "1", "-temporal-aq", "1", "-multipass", "fullres", "-rc-lookahead", "48"],
+      "pix_fmt": "yuv420p",
+      "audio_mode": "copy",
+      "audio_bitrate": "160k",
+      "container": "mp4"
+    },
+    "av1_nvenc": {
+      "tag": "av1",
+      "description": "NVENC AV1：同画质下体积最小（约比 HEVC 再省 15-25%），需较新播放器。",
+      "encoder": "av1_nvenc",
+      "vparams": ["-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", "30", "-b:v", "0",
+                  "-spatial-aq", "1", "-temporal-aq", "1", "-multipass", "fullres"],
+      "pix_fmt": "yuv420p",
+      "audio_mode": "copy",
+      "audio_bitrate": "160k",
+      "container": "mp4"
+    },
+    "hevc_x265_hq": {
+      "tag": "x265",
+      "description": "软件 x265 高质量（最慢）：体积最小、画质最佳，适合少量精品文件。",
+      "encoder": "libx265",
+      "vparams": ["-preset", "medium", "-crf", "24",
+                  "-x265-params", "aq-mode=3:rd=6:rdoq-level=2:psy-rd=1.0:deblock=-1,-1"],
+      "pix_fmt": "yuv420p",
+      "audio_mode": "copy",
+      "audio_bitrate": "160k",
+      "container": "mp4"
+    },
+    "h264_x264": {
+      "tag": "x264",
+      "description": "软件 x264：兼容性最好（任何设备都能播），体积下降中等。",
+      "encoder": "libx264",
+      "vparams": ["-preset", "slow", "-crf", "20"],
+      "pix_fmt": "yuv420p",
+      "audio_mode": "copy",
+      "audio_bitrate": "160k",
+      "container": "mp4"
+    }
+  }
+}
