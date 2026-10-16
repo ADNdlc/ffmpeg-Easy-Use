@@ -32,6 +32,7 @@ vpipe —— 本地视频批量压缩管线（scan / plan / encode / report / co
 依赖：ffmpeg.exe / ffprobe.exe（路径由 config.json 的 ffmpeg_dir 指定，初始化脚本会自动写入）
 """
 import argparse
+import contextlib
 import csv
 import html
 import json
@@ -61,6 +62,17 @@ LAST_PROBE_ERR = ''
 # Windows Job Object：保证父进程消失时子进程被连带终止，杜绝孤儿进程
 JOB_HANDLE = None
 _job_k = None
+_job_warned = False     # 「Job Object 不可用」是否已告警（只提示一次，避免刷屏）
+
+
+def _warn_job(reason):
+    """Job Object 不可用时告警一次——孤儿进程保护静默失效会让用户误以为有兜底，
+    必须显式告知（日志/控制台可见）。"""
+    global _job_warned
+    if _job_warned:
+        return
+    _job_warned = True
+    log("警告: Job Object 绑定失败（%s），孤儿进程保护不可用——父进程异常退出时子 ffmpeg 可能残留。" % reason)
 
 
 def _init_job_object():
@@ -113,32 +125,39 @@ def _init_job_object():
 
         h = k.CreateJobObjectW(None, None)
         if not h:
+            _warn_job('CreateJobObjectW 失败')
             return
         info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if not k.SetInformationJobObject(h, 9, ctypes.byref(info), ctypes.sizeof(info)):
             k.CloseHandle(h)
+            _warn_job('SetInformationJobObject 失败')
             return
         JOB_HANDLE = h
         _job_k = k
-    except Exception:
+    except Exception as e:                                     # noqa: BLE001
         JOB_HANDLE = None
         _job_k = None
+        _warn_job('初始化异常 %s' % e)
 
 
 def _assign_job(proc):
-    """把子进程加入 Job Object；失败时静默降级（不影响正常编码）。"""
+    """把子进程加入 Job Object；失败时告警（孤儿进程保护不可用）。"""
     if os.name != 'nt' or not JOB_HANDLE or _job_k is None or proc is None:
         return
     try:
         PROCESS_SET_QUOTA = 0x0100
         PROCESS_TERMINATE = 0x0001
         hp = _job_k.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, proc.pid)
-        if hp:
-            _job_k.AssignProcessToJobObject(JOB_HANDLE, hp)
-            _job_k.CloseHandle(hp)
-    except Exception:
-        pass
+        if not hp:
+            _warn_job('OpenProcess 失败 (pid=%d)' % proc.pid)
+            return
+        ok = _job_k.AssignProcessToJobObject(JOB_HANDLE, hp)
+        _job_k.CloseHandle(hp)
+        if not ok:
+            _warn_job('AssignProcessToJobObject 失败 (pid=%d)' % proc.pid)
+    except Exception as e:                                     # noqa: BLE001
+        _warn_job('绑定异常 %s' % e)
 
 
 def _terminate_proc(proc, wait=5):
@@ -490,7 +509,27 @@ def load_state(work, profile):
     st.setdefault('out_dir', None)
     if not isinstance(st.get('items'), dict):
         st['items'] = {}
+    else:
+        st['items'] = _migrate_state_items(st['items'])
     return st
+
+
+def _migrate_state_items(items):
+    """把旧版「以文件名为主键」的条目迁移为绝对路径主键，并补上 name 字段。
+    同一路径出现重复条目时保留信息更完整的那条（含 out/size_out 的优先）。"""
+    norm = {}
+    for k, it in items.items():
+        if isinstance(it, dict) and it.get('in'):
+            it.setdefault('name', os.path.basename(it['in']))
+            nk = state_key(it['in'])
+        else:
+            nk = k
+        prev = norm.get(nk)
+        if prev is None:
+            norm[nk] = it
+        elif it.get('out') and not prev.get('out'):
+            norm[nk] = it
+    return norm
 
 
 def save_state(work, profile, st):
@@ -531,15 +570,78 @@ def resolve_workspace(cfg, override=None, out_root=''):
     return os.path.abspath(cfg.get('input_dir') or '')
 
 
+def _norm_ws(path):
+    """工作区比较用的规范化路径（不区分大小写、去掉尾部斜杠）。"""
+    return os.path.normcase(os.path.abspath(path)).rstrip('\\/')
+
+
+def ws_dir_of(path):
+    """一个输入路径对应的工作区目录：目录本身，或文件所在目录。"""
+    p = os.path.abspath(path)
+    return p if os.path.isdir(p) else os.path.dirname(p)
+
+
+def protected_dirs():
+    """不适合作为工作区的顶层目录：盘根、系统目录、用户主目录、Users 容器。"""
+    out = set()
+    for k in ('SystemRoot', 'windir', 'ProgramData', 'ProgramFiles',
+              'ProgramFiles(x86)', 'USERPROFILE'):
+        v = os.environ.get(k)
+        if v:
+            out.add(_norm_ws(v))
+    out.add(_norm_ws(os.path.join((os.environ.get('SystemDrive') or 'C:') + os.sep, 'Users')))
+    out.add(_norm_ws(os.path.expanduser('~')))
+    out.discard('')
+    return out
+
+
+def workspace_protected(ws):
+    """ws 是否为不该写入产物的顶层目录（盘根 / 系统目录 / 用户主目录 / Users 容器）。
+    在这些目录下写 .data、审阅.bat、报告会污染系统或个人目录，且审阅页会递归全盘扫描。"""
+    if not ws:
+        return True
+    n = _norm_ws(ws)
+    if not n:
+        return True
+    if os.path.splitdrive(n)[1] in ('', '\\', '/'):
+        return True                                  # 盘根，如 d: / c:
+    return n in protected_dirs()
+
+
 def common_dir_of(paths):
-    """一组文件的共同所在目录（拖拽时用来确定工作区）；无法归并时退化为第一个文件所在目录。"""
-    dirs = [os.path.dirname(os.path.abspath(p)) for p in paths]
+    """一组路径的共同工作区：仅当归并结果安全（非盘根/系统目录/主目录）时返回它，
+    否则返回 ''，由调用方按每个路径所在目录分别建工作区。
+    避免多个目录拖入时 os.path.commonpath 把工作区退化为盘根或用户主目录。"""
+    dirs = [ws_dir_of(p) for p in paths]
     if not dirs:
         return ''
-    try:
-        return os.path.commonpath(dirs)
-    except ValueError:
+    if len({_norm_ws(d) for d in dirs}) == 1:
         return dirs[0]
+    try:
+        cand = os.path.commonpath(dirs)
+    except ValueError:
+        return ''
+    return '' if workspace_protected(cand) else cand
+
+
+def plan_workspaces(paths):
+    """把输入路径按工作区分组，返回 [(ws, [原始路径...]), ...]（按首次出现顺序）。
+    同目录或有安全共同祖先的归为一组；无法安全归并时逐目录分组。"""
+    ps = [p for p in (paths or []) if isinstance(p, str) and p.strip()]
+    if not ps:
+        return []
+    ws = common_dir_of(ps)
+    if ws:
+        return [(ws, ps)]
+    groups, order = {}, []
+    for p in ps:
+        d = ws_dir_of(p)
+        k = _norm_ws(d)
+        if k not in groups:
+            groups[k] = (d, [])
+            order.append(k)
+        groups[k][1].append(p)
+    return [groups[k] for k in order]
 
 
 def _profile_out_root(cfg, prof_name):
@@ -558,8 +660,56 @@ def review_key(path):
     return os.path.normcase(os.path.abspath(path))
 
 
+def state_key(path):
+    """state/报告用主键：与 review_key 对齐（绝对路径的 normcase 形式）。
+    旧版以「文件名」为主键，同名不同目录的文件会互相覆盖，这里统一改用路径主键。"""
+    return review_key(path)
+
+
 def review_path(work):
     return os.path.join(os.path.abspath(work), REVIEW_NAME)
+
+
+REVIEW_LOCK_NAME = 'review.lock'
+REVIEW_LOCK_STALE = 30.0       # 锁文件超过该秒数视为遗留（进程崩溃）而强制接管
+
+
+@contextlib.contextmanager
+def review_file_lock(work, timeout=8.0):
+    """review.json 的跨进程互斥：压缩进程(vpipe)与审阅服务(review.py)都会读写它，
+    用「独占创建锁文件」串行化各自的读-改-写，避免并发写互相覆盖导致丢失更新。
+    超时未获得锁则放弃加锁（业务不阻塞，只是退化为旧行为）。returns: 是否成功持锁。"""
+    lp = os.path.join(os.path.abspath(work), REVIEW_LOCK_NAME)
+    try:
+        os.makedirs(os.path.abspath(work), exist_ok=True)
+    except OSError:
+        pass
+    deadline = time.time() + timeout
+    got = False
+    while True:
+        try:
+            fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode('ascii'))
+            finally:
+                os.close(fd)
+            got = True
+            break
+        except OSError:
+            try:                                              # 遗留锁：过期则强制接管
+                if time.time() - os.path.getmtime(lp) > REVIEW_LOCK_STALE:
+                    _remove_quiet(lp)
+                    continue
+            except OSError:
+                pass
+            if time.time() >= deadline:
+                break
+            time.sleep(0.05)
+    try:
+        yield got
+    finally:
+        if got:
+            _remove_quiet(lp)
 
 
 def ensure_review_migrated(work):
@@ -642,73 +792,79 @@ def mark_review_pending(work, pairs, root=''):
     if not pairs:
         return
     p = review_path(work)
-    rv = None
-    if os.path.isfile(p):
+    with review_file_lock(work, timeout=5.0):
+        rv = None
+        if os.path.isfile(p):
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    rv = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                log("    警告: 审阅状态无法读取，本轮不登记待审阅项（%s）" % e)
+                return
+        if not isinstance(rv, dict):
+            rv = {'version': 2, 'root': '', 'items': {}}
+        if root and not rv.get('root'):
+            rv['root'] = os.path.abspath(root)
+        if not isinstance(rv.get('items'), dict):
+            rv['items'] = {}
+        items = rv['items']
+        for src, out, tag in pairs:
+            for path, kind, parent, tg in ((src, 'source', None, None),
+                                           (out, 'result', src, tag)):
+                if not path:
+                    continue
+                fresh = _review_item(path, kind, tg, parent)
+                k = review_key(path)
+                it = items.get(k)
+                if it is None:
+                    items[k] = fresh
+                else:
+                    for f in ('kind', 'parent', 'delete', 'filtered', 'reviewed', 'cleaned', 'history'):
+                        it.setdefault(f, fresh[f])
+        rv['updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        tmp = p + '.tmp'
         try:
-            with open(p, 'r', encoding='utf-8') as f:
-                rv = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            log("    警告: 审阅状态无法读取，本轮不登记待审阅项（%s）" % e)
-            return
-    if not isinstance(rv, dict):
-        rv = {'version': 2, 'root': '', 'items': {}}
-    if root and not rv.get('root'):
-        rv['root'] = os.path.abspath(root)
-    if not isinstance(rv.get('items'), dict):
-        rv['items'] = {}
-    items = rv['items']
-    for src, out, tag in pairs:
-        for path, kind, parent, tg in ((src, 'source', None, None),
-                                       (out, 'result', src, tag)):
-            if not path:
-                continue
-            fresh = _review_item(path, kind, tg, parent)
-            k = review_key(path)
-            it = items.get(k)
-            if it is None:
-                items[k] = fresh
-            else:
-                for f in ('kind', 'parent', 'delete', 'filtered', 'reviewed', 'cleaned', 'history'):
-                    it.setdefault(f, fresh[f])
-    rv['updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
-    tmp = p + '.tmp'
-    try:
-        os.makedirs(work, exist_ok=True)
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(rv, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, p)
-    except OSError as e:
-        log("    警告: 审阅状态未能写入（%s）" % e)
-        _remove_quiet(tmp)
+            os.makedirs(work, exist_ok=True)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(rv, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, p)
+        except OSError as e:
+            log("    警告: 审阅状态未能写入（%s）" % e)
+            _remove_quiet(tmp)
 
 
 def write_review_shortcut(ws):
-    """在工作区根目录生成/刷新「审阅.bat」（GBK + CRLF）。该入口把源目录与数据目录都固定到
-    本工作区，只审阅当前工作区的内容；可反复双击。返回路径或 None。"""
+    """在工作区根目录生成/刷新「审阅.bat」。该入口把源目录与数据目录都固定到
+    本工作区，只审阅当前工作区的内容；可反复双击。返回路径或 None。
+    路径可被 GBK 表示时用 GBK + chcp 936（兼容性最好）；含 emoji 等 GBK 之外的字符时
+    改用 UTF-8 + chcp 65001，避免 GBK 编码抛 UnicodeEncodeError 让整批任务报错退出。"""
     ws = os.path.abspath(ws)
     data = data_dir_of(ws)
     here = os.path.dirname(os.path.abspath(__file__))
     review_py = os.path.join(here, 'review.py')
     cfg_path = os.path.join(here, 'config.json')
     p = os.path.join(ws, REVIEW_BAT_NAME)
-    lines = [
-        '@echo off',
-        'chcp 936 >nul',
+    body = [
         'python "%s" --config "%s" --input "%s" --work "%s" %%*' % (
             review_py, cfg_path, ws, ws),
         'set "RC=%ERRORLEVEL%"',
         'if not "%RC%"=="0" echo   注意: 审阅服务未能正常结束（退出码 %RC%）。',
         'if not "%RC%"=="0" pause',
         'exit /b %RC%',
-        '',
     ]
+    try:
+        "\n".join(body).encode('gbk')
+        head, enc = 'chcp 936 >nul', 'gbk'
+    except UnicodeEncodeError:
+        head, enc = 'chcp 65001 >nul', 'utf-8'
+    text = "\n".join(['@echo off', head] + body) + "\n"
     try:
         os.makedirs(ws, exist_ok=True)
         os.makedirs(data, exist_ok=True)
-        with open(p, 'w', encoding='gbk', newline='\r\n') as f:
-            f.write("\n".join(lines))
+        with open(p, 'w', encoding=enc, newline='\r\n') as f:
+            f.write(text)
         return p
-    except OSError as e:
+    except (OSError, UnicodeEncodeError) as e:
         log("警告: 审阅入口 .bat 未能写入（%s）" % e)
         return None
 
@@ -787,10 +943,54 @@ def video_args(profile):
     return args
 
 
+def aac_audio_args(profile):
+    """强制转 AAC 的音轨参数（用于音轨 copy 与封装不兼容时的自动回退）。"""
+    return ['-c:a', 'aac', '-b:a', str(profile.get('audio_bitrate', '160k')), '-ac', '2']
+
+
 def audio_args(profile):
     if profile.get('audio_mode', 'copy') == 'copy':
         return ['-c:a', 'copy']
-    return ['-c:a', 'aac', '-b:a', str(profile.get('audio_bitrate', '160k')), '-ac', '2']
+    return aac_audio_args(profile)
+
+
+# 音轨编码不被输出封装接受时，ffmpeg 会报这些错误（写头部阶段即失败，产物 0 字节）
+AUDIO_CONTAINER_MARKS = ('not currently supported in container',
+                         'could not find tag for codec')
+# mp4 封装不接受的常见音轨编码（保持 copy 时必然失败），用于 scan 阶段预检提示
+MP4_BAD_ACODECS = ('wmav1', 'wmav2', 'wmapro', 'cook', 'ra', 'vorbis')
+
+
+def audio_container_conflict(tail):
+    """从 ffmpeg 错误输出识别「音轨与封装不兼容」。"""
+    low = (tail or '').lower()
+    return any(mk in low for mk in AUDIO_CONTAINER_MARKS)
+
+
+def audio_conflict_hint(tail):
+    for line in reversed((tail or '').splitlines()):
+        low = line.lower()
+        if any(mk in low for mk in AUDIO_CONTAINER_MARKS):
+            return line.strip()[:120]
+    return '音轨编码不被输出封装支持'
+
+
+def default_container(cfg):
+    """取默认档位的封装格式（无默认档位时取第一个档位），用于 scan 阶段的兼容性预检。"""
+    profs = cfg.get('profiles') or {}
+    p = profs.get(cfg.get('default_profile')) if isinstance(profs, dict) else None
+    if not isinstance(p, dict):
+        p = next((v for v in profs.values() if isinstance(v, dict)), {}) if isinstance(profs, dict) else {}
+    return (p or {}).get('container', 'mp4')
+
+
+def audio_container_warn(acodec, container):
+    """预检：音轨编码是否与输出封装不兼容（默认 copy 模式会写头失败）。不兼容时返回提示串。"""
+    if (container or 'mp4') != 'mp4' or not acodec:
+        return None
+    if acodec.lower() in MP4_BAD_ACODECS:
+        return "音轨 %s 与 mp4 不兼容（copy 会失败），建议该档位音频改 AAC" % acodec
+    return None
 
 
 # ---------------------------------------------------------------- GPU 加速（NVDEC + CUDA 滤镜 + NVENC）
@@ -894,9 +1094,10 @@ def gpu_fatal_find(tail):
     return None
 
 
-def build_encode_cmd(tools, profile, res, rec, out_path, hw=None):
+def build_encode_cmd(tools, profile, res, rec, out_path, hw=None, force_aac=False):
     """hw: None=纯软件；'cuda-full'=NVDEC 解码 + CUDA 缩放 + GPU 编码；'cuda-decode'=仅 NVDEC 解码。
-    cuda-full 时输入帧即为 CUDA 显存帧，滤镜必须用 CUDA 版，且不能指定软件侧 pix_fmt。"""
+    cuda-full 时输入帧即为 CUDA 显存帧，滤镜必须用 CUDA 版，且不能指定软件侧 pix_fmt。
+    force_aac: 忽略档位的 audio_mode，强制把音轨转 AAC（音轨 copy 与封装不兼容时的回退）。"""
     cmd = [tools['ffmpeg'], '-hide_banner', '-y']
     if hw == 'cuda-full':
         cmd += ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda']
@@ -909,7 +1110,7 @@ def build_encode_cmd(tools, profile, res, rec, out_path, hw=None):
     cmd += video_args(profile)
     if hw != 'cuda-full':
         cmd += ['-pix_fmt', profile.get('pix_fmt', 'yuv420p')]
-    cmd += audio_args(profile)
+    cmd += aac_audio_args(profile) if force_aac else audio_args(profile)
     cmd += ['-map_metadata', '0', '-sn', '-dn']
     if profile.get('container', 'mp4') == 'mp4':
         cmd += ['-movflags', '+faststart']
@@ -1205,6 +1406,7 @@ def cmd_scan(args):
         len(records), human_size(inv['total_size']), inv_path))
 
     # 异常提示
+    container = default_container(cfg)
     for r in records:
         warns = []
         if r['hdr']:
@@ -1219,6 +1421,9 @@ def cmd_scan(args):
             warns.append("带旋转元数据")
         if r['bpp'] and r['bpp'] < 0.045:
             warns.append("源码率已较低，压缩收益有限")
+        aw = audio_container_warn(r['acodec'], container)
+        if aw:
+            warns.append(aw)
         if warns:
             log("  [注意] %-40s %s" % (r['name'][:40], ", ".join(warns)))
     return EXIT_OK
@@ -1304,7 +1509,9 @@ def _watchdog_kill(proc):
 
 def run_encode(tools, cmd, duration, logfile):
     """执行 ffmpeg，解析 -progress 输出显示进度。
-    返回 (returncode, err_tail)。具备：Job Object 绑定、看门狗超时、日志降级。"""
+    返回 (returncode, err_tail, timed_out)。具备：Job Object 绑定、看门狗超时、日志降级。
+    * Popen 失败（ffmpeg 被删/被隔离等）不抛出，转为本文件的失败返回值，避免中断整批任务。
+    * 看门狗触发时置 timed_out，供上层区分「超时」与「编码器故障」，避免无谓的降级重试。"""
     global CURRENT_PROC
     errf = None
     try:
@@ -1312,14 +1519,28 @@ def run_encode(tools, cmd, duration, logfile):
     except OSError:
         errf = None
     stderr_target = errf if errf is not None else subprocess.DEVNULL
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_target,
-                            bufsize=1, universal_newlines=True,
-                            encoding='utf-8', errors='replace')
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_target,
+                                bufsize=1, universal_newlines=True,
+                                encoding='utf-8', errors='replace')
+    except OSError as e:
+        if errf is not None:
+            errf.close()
+        return -1, "无法启动 ffmpeg: %s" % e, False
     CURRENT_PROC = proc
     _assign_job(proc)
 
-    limit = max(600.0, (duration or 0) * 12.0 + 300.0)
-    timer = threading.Timer(limit, _watchdog_kill, args=[proc])
+    if duration and duration > 0:
+        limit = max(600.0, duration * 12.0 + 300.0)
+    else:
+        limit = 1800.0          # 时长未知（探测失败/残缺文件）：放宽默认，避免被看门狗误杀
+    timed = {'hit': False}
+
+    def _watchdog_stop():
+        timed['hit'] = True
+        _watchdog_kill(proc)
+
+    timer = threading.Timer(limit, _watchdog_stop)
     timer.daemon = True
     timer.start()
 
@@ -1357,36 +1578,54 @@ def run_encode(tools, cmd, duration, logfile):
                 tail = "".join(f.readlines()[-12:])
         except OSError:
             tail = ""
-    return proc.returncode, tail
+    return proc.returncode, tail, timed['hit']
 
 
 def run_encode_with_fallback(tools, profile, res, rec, part, duration, logfile, cands, gpu_state):
     """按候选加速模式依次尝试（GPU 优先，失败自动降级），末位为纯软件兜底。
-    返回 (returncode, err_tail, 实际使用的模式)。
+    返回 (returncode, err_tail, 实际使用的模式, timed_out)。
     * 每次尝试前清掉上一次留下的同名中间文件。
-    * 若失败命中「GPU 整体不可用」关键字，则本次运行内停用后续 GPU 候选。"""
-    last_rc, last_tail = None, ''
-    for i, mode in enumerate(cands):
+    * 若失败命中「GPU 整体不可用」关键字，则本次运行内停用后续 GPU 候选。
+    * 看门狗超时属「与加速模式无关」的失败，直接停止降级重试，避免成倍耗时。
+    * 音轨 copy 与封装不兼容时（写头部即失败），用 AAC 重试一次（改用纯软件，与加速模式无关）。"""
+    last_rc, last_tail, timed = None, '', False
+    modes = list(cands)
+    audio_retry = False
+    while True:
+        for i, mode in enumerate(modes):
+            if CANCELLED:
+                return last_rc, last_tail, None, timed
+            _remove_quiet(part)
+            if i > 0:
+                log("    改用%s重试 ..." % describe_hw(mode))
+            cmd = build_encode_cmd(tools, profile, res, rec, part, hw=mode, force_aac=audio_retry)
+            last_rc, last_tail, timed = run_encode(tools, cmd, duration, logfile)
+            if last_rc == 0:
+                if mode is not None or i == 0:
+                    log("    加速: %s" % describe_hw(mode))
+                else:
+                    log("    加速: 纯软件（GPU 尝试失败后回退）")
+                return last_rc, last_tail, mode, timed
+            if timed:
+                log("    提示: 编码超时被看门狗终止（与加速模式无关），不再降级重试。")
+                return last_rc, last_tail, None, timed
+            if mode is not None and gpu_state is not None and gpu_state.get('gpu'):
+                mk = gpu_fatal_find(last_tail)
+                if mk:
+                    gpu_state['gpu'] = False
+                    log("    提示: 检测到 GPU/CUDA 不可用（%s），本次运行后续文件改用纯软件路径。" % mk)
+                    break
         if CANCELLED:
-            break
-        _remove_quiet(part)
-        if i > 0:
-            log("    改用%s重试 ..." % describe_hw(mode))
-        cmd = build_encode_cmd(tools, profile, res, rec, part, hw=mode)
-        last_rc, last_tail = run_encode(tools, cmd, duration, logfile)
-        if last_rc == 0:
-            if mode is not None or i == 0:
-                log("    加速: %s" % describe_hw(mode))
-            else:
-                log("    加速: 纯软件（GPU 尝试失败后回退）")
-            return last_rc, last_tail, mode
-        if mode is not None and gpu_state is not None and gpu_state.get('gpu'):
-            mk = gpu_fatal_find(last_tail)
-            if mk:
-                gpu_state['gpu'] = False
-                log("    提示: 检测到 GPU/CUDA 不可用（%s），本次运行后续文件改用纯软件路径。" % mk)
-                break
-    return last_rc, last_tail, None
+            return last_rc, last_tail, None, timed
+        if (not audio_retry and (profile.get('audio_mode') or 'copy') == 'copy'
+                and audio_container_conflict(last_tail)):
+            audio_retry = True
+            modes = [None]      # 音轨问题与加速模式无关：直接用纯软件 + AAC 重试一次
+            log("    提示: 音轨 copy 与输出封装不兼容（%s），改用 AAC 重试一次 ..."
+                % audio_conflict_hint(last_tail))
+            continue
+        break
+    return last_rc, last_tail, None, timed
 
 
 def cmd_encode(args):
@@ -1466,7 +1705,7 @@ def cmd_encode(args):
 
         if rv_keys and is_review_filtered(rec['path'], rv_keys):
             log("    跳过：审阅中已标记为过滤（--include-filtered 可强制处理）")
-            st['items'][rec['name']] = {'in': rec['path'], 'out': None, 'status': 'skipped',
+            st['items'][state_key(rec['path'])] = {'name': rec['name'], 'in': rec['path'], 'out': None, 'status': 'skipped',
                                         'reason': '审阅过滤', 'size_in': rec['size']}
             skipped += 1
             save_state(work, prof_name, st)
@@ -1475,7 +1714,7 @@ def cmd_encode(args):
         skip = decide_skip(cfg, rec)
         if skip and not args.force:
             log("    跳过：%s" % skip)
-            st['items'][rec['name']] = {'in': rec['path'], 'out': None, 'status': 'skipped',
+            st['items'][state_key(rec['path'])] = {'name': rec['name'], 'in': rec['path'], 'out': None, 'status': 'skipped',
                                         'reason': skip, 'size_in': rec['size']}
             skipped += 1
             save_state(work, prof_name, st)
@@ -1487,7 +1726,7 @@ def cmd_encode(args):
             odur = to_float((od or {}).get('format', {}).get('duration'))
             if od and (rec['duration'] <= 0 or abs(odur - rec['duration']) <= max(2.0, rec['duration'] * 0.02)):
                 log("    已存在，跳过（如需重编加 --force）")
-                st['items'][rec['name']] = {'in': rec['path'], 'out': out_path, 'status': 'exists',
+                st['items'][state_key(rec['path'])] = {'name': rec['name'], 'in': rec['path'], 'out': out_path, 'status': 'exists',
                                             'size_in': rec['size'], 'size_out': os.path.getsize(out_path)}
                 done += 1
                 save_state(work, prof_name, st)
@@ -1496,8 +1735,8 @@ def cmd_encode(args):
         logfile = os.path.join(work, 'log_%s_%s.txt' % (prof_name, os.path.splitext(rec['name'])[0]))
         cands = hw_candidates(cfg, profile, res, rec, args, gpu_state['gpu'])
         tstart = time.time()
-        rc, tail, _hw = run_encode_with_fallback(tools, profile, res, rec, part, rec['duration'],
-                                                 logfile, cands, gpu_state)
+        rc, tail, _hw, timed = run_encode_with_fallback(tools, profile, res, rec, part, rec['duration'],
+                                                        logfile, cands, gpu_state)
         dt = time.time() - tstart
 
         if CANCELLED:
@@ -1507,7 +1746,7 @@ def cmd_encode(args):
 
         if rc == 0 and os.path.isfile(part) and os.path.getsize(part) > 0:
             if not finalize_output(part, out_path):
-                st['items'][rec['name']] = {'in': rec['path'], 'out': None, 'status': 'error',
+                st['items'][state_key(rec['path'])] = {'name': rec['name'], 'in': rec['path'], 'out': None, 'status': 'error',
                                             'size_in': rec['size'], 'returncode': rc, 'log': logfile}
                 err += 1
                 save_state(work, prof_name, st)
@@ -1516,17 +1755,20 @@ def cmd_encode(args):
             ratio = so / rec['size'] * 100 if rec['size'] else 0
             log("\r    完成  %s -> %s (%.1f%%)  用时 %s" % (
                 human_size(rec['size']), human_size(so), ratio, human_time(dt)))
-            st['items'][rec['name']] = {'in': rec['path'], 'out': out_path, 'status': 'ok',
+            st['items'][state_key(rec['path'])] = {'name': rec['name'], 'in': rec['path'], 'out': out_path, 'status': 'ok',
                                         'size_in': rec['size'], 'size_out': so,
                                         'duration': rec['duration'], 'elapsed': round(dt, 1)}
             done += 1
         else:
             _remove_quiet(part)
             log("\r    失败 (returncode=%s)" % rc)
+            if timed:
+                log("    原因: 编码超过看门狗时限（与加速模式无关），已终止该文件。")
             if tail:
                 log("    最后输出:\n" + "\n".join("      " + l for l in tail.strip().splitlines()))
-            st['items'][rec['name']] = {'in': rec['path'], 'out': out_path, 'status': 'error',
-                                        'size_in': rec['size'], 'returncode': rc, 'log': logfile}
+            st['items'][state_key(rec['path'])] = {'name': rec['name'], 'in': rec['path'], 'out': out_path,
+                                                   'status': 'timeout' if timed else 'error',
+                                                   'size_in': rec['size'], 'returncode': rc, 'log': logfile}
             err += 1
         save_state(work, prof_name, st)
 
@@ -1591,12 +1833,13 @@ def cmd_report(args):
         die("尚无 %s 的编码结果，请先运行 encode" % prof_name)
 
     rows = []
-    for name, it in st['items'].items():
+    for key, it in st['items'].items():
         if it.get('status') not in ('ok', 'exists'):
             continue
         out_path = it['out']
         if not out_path or not os.path.isfile(out_path):
             continue
+        name = it.get('name') or os.path.basename(it.get('in') or key)
         if args.quality:
             log("  画质度量: %s ..." % name)
         rows.append(build_row(tools, name, it['in'], out_path, it['size_in'],
@@ -1667,14 +1910,20 @@ def cmd_compare(args):
     if not st['items']:
         die("尚无编码结果，请先运行 encode")
 
-    names = args.only if args.only else [n for n, it in st['items'].items() if it.get('status') in ('ok', 'exists')]
+    items = st['items']
+    if args.only:
+        want = set(args.only)
+        chosen = [(k, it) for k, it in items.items()
+                  if k in want or (it.get('name') or '') in want]
+    else:
+        chosen = [(k, it) for k, it in items.items() if it.get('status') in ('ok', 'exists')]
     pairs = []
-    for name in names:
-        it = st['items'].get(name)
-        if it and it.get('out') and os.path.isfile(it['out']):
-            pairs.append((name, it['in'], it['out']))
+    for k, it in chosen:
+        disp = it.get('name') or os.path.basename(it.get('in') or k)
+        if it.get('out') and os.path.isfile(it['out']):
+            pairs.append((disp, it['in'], it['out']))
         else:
-            log("[跳过] %s 无输出" % name)
+            log("[跳过] %s 无输出" % disp)
     cmp_dir = os.path.join(work, 'compare')
     run_compare(tools, pairs, cmp_dir, args.mode, args.start, args.dur)
     log("\n对比产物目录: " + cmp_dir)
@@ -1697,22 +1946,24 @@ def merge_results_into_state(work, prof_name, results, out_dir=None):
     if out_dir:
         st['out_dir'] = out_dir
     for r in results:
-        name = r['name']
+        key = state_key(r['in']) if r.get('in') else r['name']
         if r['status'] in ('ok', 'exists'):
-            entry = {'in': r['in'], 'out': r['out'], 'status': r['status'],
+            entry = {'name': r['name'], 'in': r['in'], 'out': r['out'], 'status': r['status'],
                      'size_in': r.get('size_in'), 'size_out': r.get('size_out')}
             if r.get('duration') is not None:
                 entry['duration'] = r['duration']
-            st['items'][name] = entry
+            st['items'][key] = entry
         else:
-            st['items'].setdefault(name, {'in': r.get('in'), 'out': None, 'status': r['status'],
-                                          'size_in': r.get('size_in'), 'reason': r.get('reason')})
+            st['items'].setdefault(key, {'name': r['name'], 'in': r.get('in'), 'out': None,
+                                         'status': r['status'], 'size_in': r.get('size_in'),
+                                         'reason': r.get('reason')})
     save_state(work, prof_name, st)
 
 
-def cmd_drag(args):
-    """拖拽/命令行入口：把文件或目录直接压缩到源目录（命名加后缀），并出体积报告与审阅入口。
-    每个目标目录视为一个独立工作区：报告与「审阅.bat」在其根目录，日志/json 在其 .data 下。"""
+def drag_single_workspace(args):
+    """单个工作区的拖拽处理：把文件或目录直接压缩到源目录（命名加后缀），并出体积报告与审阅入口。
+    每个目标目录视为一个独立工作区：报告与「审阅.bat」在其根目录，日志/json 在其 .data 下。
+    由 cmd_drag 按工作区分组后逐组调用（args.work 已指定本组工作区）。"""
     cfg = load_config(args.config)
     tools = tools_from_cfg(cfg)
     prof_name, profile = pick_profile(cfg, args.profile)
@@ -1792,8 +2043,8 @@ def cmd_drag(args):
         logfile = os.path.join(work, 'log_%s_%s.txt' % (prof_name, os.path.splitext(rec['name'])[0]))
         cands = hw_candidates(cfg, profile, res, rec, args, gpu_state['gpu'])
         tstart = time.time()
-        rc, tail, _hw = run_encode_with_fallback(tools, profile, res, rec, part, rec['duration'],
-                                                 logfile, cands, gpu_state)
+        rc, tail, _hw, timed = run_encode_with_fallback(tools, profile, res, rec, part, rec['duration'],
+                                                        logfile, cands, gpu_state)
         dt = time.time() - tstart
 
         if CANCELLED:
@@ -1817,14 +2068,16 @@ def cmd_drag(args):
         else:
             _remove_quiet(part)
             log("\r    失败 (returncode=%s)" % rc)
+            if timed:
+                log("    原因: 编码超过看门狗时限（与加速模式无关），已终止该文件。")
             if tail:
                 log("    最后输出:\n" + "\n".join("      " + l for l in tail.strip().splitlines()))
             results.append({'name': rec['name'], 'in': rec['path'], 'out': None,
-                            'status': 'error', 'size_in': rec['size'],
-                            'reason': 'ffmpeg 退出码 %s' % rc})
+                            'status': 'timeout' if timed else 'error', 'size_in': rec['size'],
+                            'reason': ('编码超时（超过看门狗时限）' if timed else 'ffmpeg 退出码 %s' % rc)})
 
     ok = [r for r in results if r['status'] in ('ok', 'exists')]
-    err = [r for r in results if r['status'] == 'error']
+    err = [r for r in results if r['status'] in ('error', 'timeout')]
     out_dir = os.path.dirname(ok[0]['out']) if ok else None
     merge_results_into_state(work, prof_name, results, out_dir)
 
@@ -1859,6 +2112,35 @@ def cmd_drag(args):
     if err:
         log("注意: 有 %d 个文件未能成功处理。" % len(err))
     return EXIT_FAIL if err else EXIT_OK
+
+
+def cmd_drag(args):
+    """拖拽/命令行入口：把文件或目录直接压缩到源目录（命名加后缀），并出体积报告与审阅入口。
+    一次拖入位于多个目录的路径时，按目录分别建立独立工作区；绝不把工作区退化为盘根或
+    用户主目录等顶层目录（那会在系统目录写 .data/审阅.bat/报告并让审阅页全盘扫描）。"""
+    cfg = load_config(args.config)
+    if args.work:
+        groups = [(os.path.abspath(args.work), list(args.paths or []))]
+    else:
+        groups = plan_workspaces(args.paths or [])
+        if not groups:
+            base = os.path.abspath(cfg.get('input_dir') or '')
+            if not base:
+                die("无法确定工作区：请拖入视频文件或目录")
+            groups = [(base, [])]
+    if len(groups) > 1:
+        log("检测到多个不同目录，按目录分别建立独立工作区：")
+        for gw, _gp in groups:
+            log("  - %s" % gw)
+
+    rc = EXIT_OK
+    for ws, gpaths in groups:
+        sub = argparse.Namespace(**vars(args))
+        sub.work = ws
+        sub.paths = gpaths
+        if drag_single_workspace(sub) == EXIT_FAIL:
+            rc = EXIT_FAIL
+    return rc
 
 
 # ---------------------------------------------------------------- CLI

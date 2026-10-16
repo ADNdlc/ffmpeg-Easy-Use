@@ -27,13 +27,17 @@
   .pos{font-family:var(--mono); font-size:13px; color:var(--fg2);}
   .warn{color:var(--warn); font-size:12px;}
 
-  .stage{position:relative; flex:1; min-height:180px; background:#000; overflow:hidden; cursor:ew-resize; touch-action:none;}
+  .stage{position:relative; flex:1; min-height:180px; background:#000; overflow:hidden; cursor:default; touch-action:none;}
+  .stage.following{cursor:ew-resize;}
   .layer{position:absolute; inset:0; width:100%; height:100%; object-fit:contain; display:block;}
   .layer.res{clip-path:inset(0 0 0 var(--pos,50%));}
   .divider{position:absolute; top:0; bottom:0; left:var(--pos,50%); width:2px; margin-left:-1px; background:var(--brand); pointer-events:none; z-index:3;}
   .knob{position:absolute; top:50%; left:50%; width:30px; height:30px; margin:-15px 0 0 -15px; border-radius:50%;
         background:var(--brand); color:#04140e; font-size:11px; letter-spacing:-1px;
-        display:flex; align-items:center; justify-content:center; box-shadow:0 0 0 2px rgba(0,0,0,.55);}
+        display:flex; align-items:center; justify-content:center; box-shadow:0 0 0 2px rgba(0,0,0,.55);
+        pointer-events:auto; cursor:pointer; transition:box-shadow .12s, background .12s;}
+  .knob:hover{box-shadow:0 0 0 2px rgba(0,0,0,.55), 0 0 0 4px rgba(255,255,255,.30);}
+  .knob.on{background:#fff; box-shadow:0 0 0 2px rgba(0,0,0,.55), 0 0 10px 2px var(--brand);}
   .lab{position:absolute; top:10px; font-size:12px; padding:3px 8px; border-radius:6px; z-index:4;
        background:rgba(0,0,0,.55); border:1px solid var(--line2);}
   .lab-l{left:10px;} .lab-r{right:10px; color:var(--brand);}
@@ -99,6 +103,17 @@
   .badge.w{color:var(--warn); border-color:var(--warn);}
   .sheet .foot{display:flex; justify-content:flex-end; gap:10px; margin-top:18px; align-items:center;}
   .sheet .foot .spacer{flex:1;}
+  /* 二次确认模态：叠在汇总之上；删除清单独立滚动，表头吸顶 */
+  .sheet.cfm{z-index:26;}
+  .sheet.cfm .box{width:min(880px,94vw);}
+  .cfm-title{color:var(--danger);}
+  .cfmlist{max-height:46vh; overflow:auto; border:1px solid var(--line); border-radius:6px; margin:4px 0 0;}
+  .cfmlist table{border-collapse:collapse;}
+  .cfmlist thead th{position:sticky; top:0; background:var(--panel); z-index:1;}
+  .btn-cancel{background:transparent; color:var(--fg2); border-color:var(--line2);}
+  .btn-cancel:hover:not(:disabled){color:var(--fg); border-color:var(--fg2);}
+  .btn-danger{background:var(--danger); border-color:var(--danger); color:#fff; font-weight:600;}
+  .btn-danger:hover:not(:disabled){background:#c34e2e; border-color:#c34e2e;}
   .toast{position:fixed; left:50%; bottom:26px; transform:translateX(-50%); background:var(--panel2);
          border:1px solid var(--brand); color:var(--fg); padding:8px 16px; border-radius:20px; font-size:13px; z-index:30;
          max-width:70vw; text-align:center;}
@@ -129,7 +144,7 @@
 <div class="stage" id="stage">
   <video class="layer" id="vSrc" muted playsinline preload="metadata"></video>
   <video class="layer res" id="vRes" muted playsinline preload="metadata"></video>
-  <div class="divider" id="divider"><span class="knob">&#9668;&#9658;</span></div>
+  <div class="divider" id="divider"><span class="knob" id="knob" title="点击选中分隔线并跟随鼠标">&#9668;&#9658;</span></div>
   <div class="lab lab-l" id="labSrc">源</div>
   <div class="lab lab-r" id="labRes">结果</div>
   <div class="hint" id="hint" hidden></div>
@@ -177,6 +192,10 @@
 
 <div class="sheet" id="sheet" hidden>
   <div class="box" id="sheetBox"></div>
+</div>
+
+<div class="sheet cfm" id="cfm" hidden>
+  <div class="box" id="cfmBox"></div>
 </div>
 
 <div class="toast" id="toast" hidden></div>
@@ -255,7 +274,7 @@
       b.className = 'tab' + (i === ci ? ' act' : '');
       b.textContent = res.tag || ('结果' + (i+1));
       b.title = res.name;
-      b.onclick = function(){ ci = i; syncUI(); renderTabs(); loadMedia(); };
+      b.onclick = function(){ switchResult(i); };
       wrap.appendChild(b);
     });
   }
@@ -266,11 +285,12 @@
 
   function setMedia(v, url){
     var cur = v.getAttribute('src') || '';
-    if (url === cur) return;
+    if (url === cur) return false;
     try {
       if (url){ v.src = url; v.load(); }
       else { v.removeAttribute('src'); v.load(); }
     } catch(e){}
+    return true;
   }
 
   function loadMedia(){
@@ -284,6 +304,17 @@
     if (msg) el('bigmsg').textContent = msg;
     el('hint').hidden = true;
     seekTo(0);
+  }
+
+  // 切换右侧结果：只替换结果视频，保留源的当前进度与播放状态。
+  // 结果换源后浏览器会把它停住，须等新结果元数据就绪再对齐并续播（见 alignRes），
+  // 否则切到另一编码后右侧画面会一直不动。
+  function switchResult(i){
+    ci = i; syncUI(); renderTabs();
+    el('bigmsg').hidden = true;
+    el('hint').hidden = true;
+    if (setMedia(vRes, mediaUrl(r()))) resAlignPending = true;   // 换源：等 loadedmetadata 再对齐
+    else alignRes();                                             // 同一条结果：直接对齐并续播
   }
 
   function syncUI(){
@@ -334,6 +365,7 @@
   // 一旦正在 seek 或刚手动定位过，就绝不再去改它的 currentTime——否则浏览器会不停打断
   // 结果视频的解码/缓冲，表现为拖动进度条后右侧结果卡顿甚至停住。
   var scrubbing = false, syncHold = 0, lastFix = 0, scrubTimer = 0, scrubResume = false, scrubLast = 0;
+  var resAlignPending = false;      // 结果视频换源后，待其元数据就绪再对齐并续播
   function cur(){ return vSrc.currentTime || 0; }
   function dur(){ return vSrc.duration || 0; }
   function seekTo(t){
@@ -342,6 +374,16 @@
     try { vSrc.currentTime = t; } catch(e){}
     try { vRes.currentTime = t; } catch(e){}
     paint();
+  }
+  // 把结果视频对齐到源的当前时间，并在源正在播放时续播。
+  // 切换结果会让结果视频单独换源并被浏览器停住，必须显式续播，否则右侧画面不动。
+  function alignRes(){
+    resAlignPending = false;
+    var t = vSrc.currentTime || 0;
+    if (isFinite(t) && Math.abs((vRes.currentTime || 0) - t) > 0.05){
+      try { vRes.currentTime = t; } catch(e){}
+    }
+    if (playing){ try { vRes.play(); } catch(e){} }
   }
   function setPlay(p){
     playing = p;
@@ -396,6 +438,10 @@
     vSrc.addEventListener('seeked', function(){
       if (vRes.seeking) return;
       try { vRes.currentTime = vSrc.currentTime; } catch(e){}
+    });
+    // 结果视频换源（切换编码）后，浏览器会把它停住；元数据就绪时对齐并续播
+    vRes.addEventListener('loadedmetadata', function(){
+      if (resAlignPending) alignRes();
     });
     ['error','stalled'].forEach(function(ev){
       vSrc.addEventListener(ev, function(){ if (!srcIt() || !srcIt().exists) return;
@@ -499,23 +545,57 @@
       if (sumState.checked[s.delete[i].path] && !s.delete[i].valid) staleInChecked++;
     }
     el('sheetBox').innerHTML =
-      '<h2>汇总确认</h2>' +
-      '<div class="sub">' + esc(Q ? Q.root : '') + ' · 已勾选 <b>' + checkedPaths.length +
-        '</b> 项，约 ' + fmtSize(bytes) + '（其中源文件 ' + srcCount + ' 项）' +
-        (s.unreviewed ? ' · 还有 <b>' + s.unreviewed + '</b> 项未审阅' : '') + '</div>' +
-      (staleInChecked ? '<div class="sub" style="color:var(--danger)">删除清单里有 ' + staleInChecked +
-        ' 项记录已失效（文件被改动或移动），执行时会被自动跳过。</div>' : '') +
-      '<h3>删除清单（勾选即送回收站）</h3>' + tableHtml(s.delete) +
-      '<h3>保留清单（勾选可临时加入删除）</h3>' + tableHtml(s.keep) +
-      '<div class="foot"><span class="sub">执行顺序：先删结果、最后删源；全部进回收站，可回滚。</span>' +
-      '<span class="spacer"></span>' +
-      '<button class="ghost" id="sumClose">继续审阅</button>' +
-      '<button id="sumApply">确认执行（' + checkedPaths.length + '）</button></div>';
+    '<h1>汇总确认</h1>' +
+    '<div class="sub">' + esc(Q ? Q.root : '') + ' · 已勾选 <b>' + checkedPaths.length +
+      '</b> 项，约 ' + fmtSize(bytes) + '（其中源文件 ' + srcCount + ' 项）' +
+      (s.unreviewed ? ' · 还有 <b>' + s.unreviewed + '</b> 项未审阅' : '') + '</div>' +
+    (staleInChecked ? '<div class="sub" style="color:var(--danger)">删除清单里有 ' + staleInChecked +
+      ' 项记录已失效（文件被改动或移动），执行时会被自动跳过。</div>' : '') +
+    '<h2 style="margin-top: 16px;">删除清单（勾选即送回收站）</h2>' + tableHtml(s.delete) +
+    '<h2 style="margin-top: 16px;">保留清单（勾选可临时加入删除）</h2>' + tableHtml(s.keep) +
+    '<div class="foot"><span class="sub">执行顺序：先删结果、最后删源；全部进回收站，可回滚。</span>' +
+    '<span class="spacer"></span>' +
+    '<button class="ghost" id="sumClose">继续审阅</button>' +
+    '<button id="sumApply">确认执行（' + checkedPaths.length + '）</button></div>';
     el('sheetBox').querySelectorAll('input[type=checkbox]').forEach(function(cb){
       cb.onchange = function(){ sumState.checked[cb.getAttribute('data-p')] = cb.checked; renderSum(); };
     });
     el('sumClose').onclick = function(){ el('sheet').hidden = true; };
-    el('sumApply').onclick = function(){ apply(false); };
+    el('sumApply').onclick = openConfirm;
+  }
+
+  // 二次确认模态：把即将删除的文件逐条列出（名字/路径/大小/创建时间），确认后才真正执行
+  function openConfirm(){
+    if (!sumChecked().length){ say('没有勾选任何项'); return; }
+    renderConfirm();
+    el('cfm').hidden = false;
+  }
+  function renderConfirm(){
+    var s = sumState.data, rows = [], bytes = 0;
+    if (s){
+      [].concat(s.delete, s.keep).forEach(function(row){
+        if (sumState.checked[row.path]){ rows.push(row); bytes += row.size || 0; }
+      });
+    }
+    var body = rows.length ? rows.map(function(row){
+      return '<tr><td class="n">' + esc(row.name) + '</td>' +
+        '<td class="n">' + esc(row.path) + '</td>' +
+        '<td class="n sz">' + esc(row.size_text) + '</td>' +
+        '<td class="n sz">' + esc(row.ctime_text || '—') + '</td></tr>';
+    }).join('') : '<tr><td colspan="4" class="sub">（无）</td></tr>';
+    el('cfmBox').innerHTML =
+      '<h2 class="cfm-title">数据无价，请确认本次操作</h2>' +
+      '<h3>以下文件将被删除(送入回收站)</h3>' +
+      '<div class="sub">共 <b>' + rows.length + '</b> 项，约 <b>' + fmtSize(bytes) + '</b>；全部进回收站，可回滚。</div>' +
+      '<div class="cfmlist"><table class="tbl-fixed">' +
+        '<colgroup><col style="width:26%"><col style="width:42%"><col style="width:14%"><col style="width:18%"></colgroup>' +
+        '<thead><tr><th>名字</th><th>路径</th><th>大小</th><th>创建时间</th></tr></thead>' +
+        '<tbody>' + body + '</tbody></table></div>' +
+      '<div class="foot"><span class="spacer"></span>' +
+        '<button class="btn-cancel" id="cfmCancel">取消</button>' +
+        '<button class="btn-danger" id="cfmOk">确认删除</button></div>';
+    el('cfmCancel').onclick = function(){ el('cfm').hidden = true; };
+    el('cfmOk').onclick = function(){ el('cfm').hidden = true; apply(false); };
   }
 
   function apply(confirmSource){
@@ -565,7 +645,16 @@
   }
 
   // ---------- 交互绑定
+  // 分隔线默认不动：鼠标划过不再跟随。点线中间的圆钮＝选中并跟随（高亮），再点一次＝释放，线停在原处。
+  var knob = el('knob'), lineFollow = false;
+  function setLineFollow(on){
+    lineFollow = on;
+    knob.classList.toggle('on', on);
+    stage.classList.toggle('following', on);
+    knob.title = on ? '点击释放分隔线（停止跟随鼠标）' : '点击选中分隔线并跟随鼠标';
+  }
   function follow(e){
+    if (!lineFollow) return;
     var rct = stage.getBoundingClientRect();
     if (!rct.width) return;
     var p = Math.max(2, Math.min(98, (e.clientX - rct.left) / rct.width * 100));
@@ -574,6 +663,10 @@
   stage.addEventListener('pointermove', follow);
   stage.addEventListener('mousemove', follow);
   stage.addEventListener('pointerdown', function(e){ e.preventDefault(); });
+  // 圆钮自己处理点击，别让上面的 pointerdown 兜底逻辑干扰
+  knob.addEventListener('pointerdown', function(e){ e.stopPropagation(); });
+  knob.addEventListener('click', function(e){ e.stopPropagation(); setLineFollow(!lineFollow); });
+  setLineFollow(false);
   stage.style.setProperty('--pos', '50%');
 
   el('pp').onclick = function(){ setPlay(!playing); };
@@ -646,6 +739,7 @@
   el('rDel').onclick = function(){ toggle(r(), 'delete'); };
   el('rFil').onclick = function(){ toggle(r(), 'filtered'); };
   el('sheet').addEventListener('click', function(e){ if (e.target === el('sheet')) el('sheet').hidden = true; });
+  el('cfm').addEventListener('click', function(e){ if (e.target === el('cfm')) el('cfm').hidden = true; });
 
   window.addEventListener('beforeunload', function(){ try { vSrc.pause(); vRes.pause(); } catch(e){} });
 
@@ -659,6 +753,7 @@
   document.addEventListener('keydown', function(e){
     var k = e.key;
     if ((e.ctrlKey || e.metaKey) && (k === 'z' || k === 'Z')){ e.preventDefault(); undo(); return; }
+    if (!el('cfm').hidden){ if (k === 'Escape') el('cfm').hidden = true; return; }
     if (!el('sheet').hidden){ if (k === 'Escape') el('sheet').hidden = true; return; }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (k === ' '){ e.preventDefault(); setPlay(!playing); return; }
@@ -677,7 +772,7 @@
     if (k === 'f' || k === 'F'){ toggle(e.shiftKey ? r() : srcIt(), 'filtered'); return; }
     if (k >= '1' && k <= '9'){
       var i = +k - 1;
-      if (g() && i < g().results.length){ ci = i; syncUI(); renderTabs(); loadMedia(); }
+      if (g() && i < g().results.length){ switchResult(i); }
     }
   });
 

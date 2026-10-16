@@ -8,6 +8,10 @@ core/config.json
 # 自动下载到仓库内的 ffmpeg
 bin/
 
+# 临时文件
+temp/
+.workbuddy/
+
 # Python 缓存
 __pycache__/
 *.pyc

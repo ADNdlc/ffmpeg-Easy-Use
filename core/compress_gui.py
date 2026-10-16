@@ -29,6 +29,7 @@ compress_gui.py —— vpipe 统一压缩入口（本地单页 GUI）
 """
 import argparse
 import copy
+import itertools
 import json
 import os
 import re
@@ -62,6 +63,7 @@ RUN_DIR = os.path.join(GUI_HOME, 'gui', 'run')
 LAST_STATE = os.path.join(GUI_HOME, 'gui', 'last_state.json')
 
 EVENTS_MAX = 400
+_JOB_SEQ = itertools.count(1)                  # 给 job_id 加进程内自增序号，避免同秒内重复
 DEFAULT_PRESET_FILE = '默认预设_config.json'   # 脚本目录下的示例预设，启动时自动加载
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 NEW_GROUP = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
@@ -100,8 +102,8 @@ def init_job():
     """用 vpipe 的 Job Object 能力（本脚本不与其同进程运行 vpipe，故共用句柄安全）。"""
     try:
         vpipe._init_job_object()
-    except Exception:                                          # noqa: BLE001
-        pass
+    except Exception as e:                                     # noqa: BLE001
+        vpipe.log("警告: Job Object 初始化异常（%s），孤儿进程保护不可用。" % e)
 
 
 def norm_paths(paths):
@@ -336,8 +338,9 @@ P_DONE = re.compile(r'^完成\s+(.+?)\s*->\s*(.+?)\s+\(([\d.]+)%\)\s+用时\s+(.
 P_FAIL = re.compile(r'^失败 \(returncode=(\d+)\)$')
 P_REVIEW = re.compile(r'^审阅入口: (.+)$')
 P_REPORT = re.compile(r'^报告: (.+)$')
-P_END = re.compile(r'^(全部完成。|==== 已中断)')
-P_NOTE = re.compile(r'^(注意: .*|提示: .*|说明: .*|GPU 加速: .*|分辨率: .*|输出: .*'
+P_END = re.compile(r'^(全部完成。|==== 已中断|==== 完成)')
+P_NOTE = re.compile(r'^(注意: .*|提示: .*|说明: .*|警告: .*|已把.*|失败: .*'
+                    r'|GPU 加速: .*|分辨率: .*|输出: .*'
                     r'|工作区: .*|profile = .*|源: .*|改用.*|最后输出:.*)$')
 
 
@@ -387,6 +390,7 @@ class Runner:
 
     def __init__(self):
         self.lock = threading.Lock()
+        self._start_lock = threading.Lock()   # 串行化 start：把「检查运行中→启动→登记」锁在同一临界区
         self.proc = None
         self.thread = None
         self.job_id = ''
@@ -458,6 +462,13 @@ class Runner:
 
     # ---- 对外
     def start(self, base_cfg, req):
+        """返回 (ok, 信息)。失败时信息为中文原因。
+        「检查运行中 → 启动子进程 → 登记 self.proc」整段用 _start_lock 串行化：
+        否则两次并发请求会在锁空窗内都被放行，从而同时起两个 vpipe（TOCTOU 竞态）。"""
+        with self._start_lock:
+            return self._start_locked(base_cfg, req)
+
+    def _start_locked(self, base_cfg, req):
         """返回 (ok, 信息)。失败时信息为中文原因。"""
         with self.lock:
             if self.running:
@@ -473,7 +484,9 @@ class Runner:
         except ValueError as e:
             return False, str(e)
 
-        job_id = time.strftime('%Y%m%d_%H%M%S')
+        # job_id 追加进程号 + 进程内自增序号：秒级精度在同秒多次启动时会重名，
+        # 重名会让两次任务共用同一份临时配置，互相覆盖并误删对方正在使用的配置。
+        job_id = '%s_%d-%d' % (time.strftime('%Y%m%d_%H%M%S'), os.getpid(), next(_JOB_SEQ))
         tmp = os.path.join(RUN_DIR, '%s.json' % job_id)
         try:
             atomic_write(tmp, json.dumps(cfg, ensure_ascii=False, indent=2))
@@ -529,12 +542,16 @@ class Runner:
         return True, job_id
 
     def _reader(self, proc, tmp):
+        cont = False            # 处于「最后输出:」续行区：ffmpeg 错误明细按原样透传，不再被丢弃
         try:
             for raw in proc.stdout:
                 ev = parse_line(raw)
-                if ev:
+                if ev is not None:
+                    cont = (ev.get('kind') == 'note' and '最后输出:' in ev.get('text', ''))
                     self._push(ev)
                     self._on_event(ev)
+                elif cont and raw.strip():
+                    self._push({'kind': 'note', 'text': raw.strip()})
         except Exception as e:                                 # noqa: BLE001
             self._push({'kind': 'note', 'text': '读取输出异常: %s' % e})
         finally:
@@ -547,10 +564,9 @@ class Runner:
                 self.finished = time.time()
                 self.exit = code
                 self.percent = 100.0
-                tmp_cfg = self.tmp_cfg
             self._push({'kind': 'end', 'text': '任务结束（退出码 %s）' % code,
                         'exit': code})
-            self._safe_remove(tmp_cfg)
+            self._safe_remove(tmp)      # 只清理本次任务自己的临时配置（不是 self.tmp_cfg）
             self._save_last()
             cb = self.on_finish
             if cb:

@@ -153,21 +153,23 @@ def load_review(work, root):
 
 
 def save_review(work, rv):
-    """原子写：review.json.tmp -> os.replace。失败仅告警。"""
+    """原子写：review.json.tmp -> os.replace。失败仅告警。
+    加 _save_lock（进程内）与 review_file_lock（跨进程，压缩服务 vpipe 也会写同一个文件）。"""
     p = review_path(work)
     tmp = p + '.tmp'
     rv['updated'] = now_str()
     with _save_lock:
-        try:
-            os.makedirs(work, exist_ok=True)
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(rv, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, p)
-            return True
-        except OSError as e:
-            vpipe.log("警告: 审阅状态未能写入（%s）" % e)
-            vpipe._remove_quiet(tmp)
-            return False
+        with vpipe.review_file_lock(work):
+            try:
+                os.makedirs(work, exist_ok=True)
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(rv, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, p)
+                return True
+            except OSError as e:
+                vpipe.log("警告: 审阅状态未能写入（%s）" % e)
+                vpipe._remove_quiet(tmp)
+                return False
 
 
 # ---------------------------------------------------------------- 项与配对
@@ -220,12 +222,13 @@ def meta_of(tools, path, cached):
     if cached and cached.get('meta'):
         c = cached['meta']
         if c.get('size') == st.st_size and abs((c.get('mtime') or 0) - st.st_mtime) < 1:
+            c.setdefault('ctime', st.st_ctime)   # 旧缓存可能没记创建时间，就地补齐
             return c, None
     rec = vpipe.make_record(tools['ffprobe'], path, os.path.basename(path))
     if rec is None:
-        return {'size': st.st_size, 'mtime': st.st_mtime, 'w': 0, 'h': 0, 'fps': 0,
+        return {'size': st.st_size, 'mtime': st.st_mtime, 'ctime': st.st_ctime, 'w': 0, 'h': 0, 'fps': 0,
                 'vbitrate_kbps': 0, 'duration': 0, 'codec': ''}, (vpipe.LAST_PROBE_ERR or '无法解析')
-    return {'size': st.st_size, 'mtime': st.st_mtime, 'w': rec['disp_w'], 'h': rec['disp_h'],
+    return {'size': st.st_size, 'mtime': st.st_mtime, 'ctime': st.st_ctime, 'w': rec['disp_w'], 'h': rec['disp_h'],
             'fps': rec['fps'], 'vbitrate_kbps': rec['vbitrate_kbps'],
             'duration': rec['duration'], 'codec': rec['vcodec']}, None
 
@@ -243,15 +246,16 @@ def make_item(path, kind, tag, parent, meta, warn=''):
 
 
 def scan_items(cfg, work, rv, root=None):
-    """重扫源目录：为新文件建项、刷新元数据、剔除已消失的文件。就地更新 rv['items']。
-    root 以调用方（工作区）解析出来的源目录为准，绝不回退到 config.input_dir，避免扫到别的目录。"""
+    """重扫源目录：为新文件建项、刷新元数据、剔除已消失的文件。
+    在 items 的副本上增删，最后整体换回 rv['items']——这样调用方可以把它放在主锁之外执行
+    （ffprobe 很慢），并发的读取线程仍能安全地遍历旧的对象。"""
     tools = tools_of(cfg)
     root = os.path.abspath(root or rv.get('root') or '')
     if not root or not os.path.isdir(root):
         return {'scanned': 0, 'added': 0, 'dropped': 0, 'warned': 0,
                 'error': '源目录不存在或未配置 input_dir: %s' % (root or '(未设置)')}
     rv['root'] = root
-    items = rv['items']
+    items = dict(rv['items'])
     seen, added, warned = set(), 0, 0
 
     for path, rel in vpipe.iter_files(root, exclude_dirs=[os.path.join(root, '_work'),
@@ -297,6 +301,11 @@ def scan_items(cfg, work, rv, root=None):
     for k, it in list(items.items()):
         if k in seen:
             continue
+        if it.get('cleaned'):
+            # 已由用户删除（送回收站）的项：文件不在磁盘属预期，保留条目本身。
+            # 待其从回收站还原后，_reconcile 会撤销 cleaned/delete 标记，
+            # 并连同原 filtered/history 一起恢复（否则会被当成新项重建，丢失用户选择）。
+            continue
         # 源目录之外的项（例如拖拽处理过的、input_dir 之外的文件）不归本次扫描管：
         # 只要文件还在就保留它；文件确实消失了才剔除（既清理已删除项，也保住手动登记的内容）。
         inside = k.startswith(root_nc + os.sep)
@@ -318,6 +327,7 @@ def scan_items(cfg, work, rv, root=None):
             if not it.get('tag'):
                 it['tag'] = tag_of(cfg, p)
 
+    rv['items'] = items
     return {'scanned': len(seen), 'added': added, 'dropped': dropped,
             'warned': warned, 'error': None}
 
@@ -437,10 +447,13 @@ def validate_item(it):
 
 def row_of(it, src_size=None):
     m = it.get('meta') or {}
+    ct = m.get('ctime') or 0
     row = {'path': it['path'], 'name': it['name'], 'kind': it['kind'], 'tag': it.get('tag'),
           'size': m.get('size') or 0, 'size_text': vpipe.human_size(m.get('size') or 0),
           'meta_text': fmt_meta(m), 'warn': it.get('warn') or '',
-          'filtered': bool(it.get('filtered')), 'reviewed': bool(it.get('reviewed'))}
+          'filtered': bool(it.get('filtered')), 'reviewed': bool(it.get('reviewed')),
+          'ctime': ct,
+          'ctime_text': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ct)) if ct else '—'}
     if src_size:
         row['saving'] = round(100.0 - (m.get('size') or 0) * 100.0 / src_size, 1)
     return row
@@ -669,6 +682,7 @@ class ServerState(object):
         self.work = work
         self.root = root
         self.lock = threading.RLock()
+        self.scan_lock = threading.Lock()   # 串行化重扫；重扫的 ffprobe 在主锁之外执行
         self.rv = load_review(work, root)
         self.info = None
         self.queue = None
@@ -685,11 +699,17 @@ class ServerState(object):
         self.queue = build_queue(self.cfg, self.work, self.rv)
         self.tokens = self.queue['tokens']
 
+    def rescan(self):
+        """重扫源目录：ffprobe 很慢，放在 scan_lock 内、主锁之外执行，
+        避免长时间占用主锁而让页面轮询/播放请求全部卡住。"""
+        with self.scan_lock:
+            return scan_items(self.cfg, self.work, self.rv, self.root)
+
     def refresh(self, rescan=True):
-        """（可选重扫）+ 重算分组 + 落盘。"""
+        """（可选重扫）+ 重算分组 + 落盘。重扫在锁外执行，只有结果落盘时才持主锁。"""
+        if rescan:
+            self.info = self.rescan()
         with self.lock:
-            if rescan:
-                self.info = scan_items(self.cfg, self.work, self.rv, self.root)
             self.rebuild()
             save_review(self.work, self.rv)
         return self.info
@@ -928,7 +948,8 @@ class Handler(BaseHTTPRequestHandler):
                 report = apply_delete(st.rv, data.get('delete') or None,
                                       confirm_source=bool(data.get('confirm_source')),
                                       force=bool(data.get('force')))
-                it_after = scan_items(st.cfg, st.work, st.rv, st.root)   # 删完立即重扫，剔除已消失项
+            it_after = st.rescan()          # 删完重扫（在锁外执行，避免卡住页面轮询）
+            with st.lock:
                 st.info = it_after
                 st.rebuild()
                 save_review(st.work, st.rv)
@@ -936,8 +957,8 @@ class Handler(BaseHTTPRequestHandler):
                                    'progress': st.queue['progress'],
                                    'scan': it_after})
         if p == '/api/rescan':
+            info = st.rescan()
             with st.lock:
-                info = scan_items(st.cfg, st.work, st.rv, st.root)
                 st.info = info
                 st.rebuild()
                 save_review(st.work, st.rv)
