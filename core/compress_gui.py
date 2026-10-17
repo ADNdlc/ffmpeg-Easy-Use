@@ -592,7 +592,7 @@ class Runner:
             cb = self.on_finish
             if cb:
                 try:
-                    cb(list(self.paths))      # 通知 State：本批路径已处理完
+                    cb(list(self.paths), code)     # 通知 State：本批结束，附带退出码
                 except Exception:              # noqa: BLE001
                     pass
 
@@ -670,7 +670,7 @@ class State:
         self.file_presets = []
         self.file_preset_path = ''
         self.runner = Runner()
-        self.runner.on_finish = self._on_runner_finish   # 任务结束后清理已处理的待处理路径
+        self.runner.on_finish = self._on_runner_finish   # 整批成功才清理待处理路径（失败/取消保留）
         self.httpd = None
         self.hw = detect_hw_caps(cfg)                    # 本机硬件能力（None=未知，不阻断档位）
         # 启动时自动加载脚本目录下的示例预设文件（若有）
@@ -709,17 +709,18 @@ class State:
             return ''
         return first if os.path.isdir(first) else os.path.dirname(first)
 
-    def _on_runner_finish(self, batch):
-        """任务结束回调：把本批已处理的路径从待处理列表移除，并记录工作区。
-        避免「拖入新目录后仍在旧路径上重复启动」，也让「打开审阅」指向最近一次任务。"""
+    def _on_runner_finish(self, batch, code=0):
+        """任务结束回调：整批成功（退出码 0）时把本批路径从待处理列表移除，并记录工作区。
+        失败或用户主动终止时不移除，保留原路径便于直接重试。
+        记录工作区是为了让「打开审阅」指向最近一次任务。"""
         with self.lock:
-            keys = set(os.path.normcase(os.path.abspath(p)) for p in (batch or []))
-            if keys:
-                self.paths = [p for p in self.paths
-                              if os.path.normcase(os.path.abspath(p)) not in keys]
             if batch:
                 b0 = batch[0]
                 self.last_ws = b0 if os.path.isdir(b0) else os.path.dirname(b0)
+            if batch and code == 0:
+                keys = set(os.path.normcase(os.path.abspath(p)) for p in batch)
+                self.paths = [p for p in self.paths
+                              if os.path.normcase(os.path.abspath(p)) not in keys]
 
     def set_base_config(self, data, path):
         cfg = absorb_config(data)
