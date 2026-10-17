@@ -73,6 +73,7 @@
   .tabs{display:flex; gap:4px; flex-wrap:wrap; justify-content:flex-end;}
   .tab{font-size:11.5px; padding:2px 8px; border-radius:12px; background:transparent; font-family:var(--mono);}
   .tab.act{background:var(--panel2); border-color:var(--brand); color:var(--brand);}
+  .tab.dead{opacity:.45; text-decoration:line-through;}
   .nav{font-size:15px; padding:2px 0; width:46px; text-align:center;}
   #pg{display:inline-block; min-width:66px; text-align:center;}
   .ghost{background:transparent;}
@@ -251,7 +252,7 @@
         return;
       }
       if (keepPos) { gi = Math.min(g0, n-1); ci = Math.min(c0, (Q.groups[gi].results.length-1)); }
-      else { gi = Math.min(Q.start_index || 0, n-1); ci = 0; }
+      else { gi = Math.min(Q.start_index || 0, n-1); ci = liveResultIndex(Q.groups[gi].results); }
       if (ci < 0) ci = 0;
       el('rootTxt').textContent = Q.root || '';
       if (Q.scan && Q.scan.error) say(Q.scan.error, true);
@@ -268,14 +269,25 @@
     el('pos').textContent = (gi+1) + ' / ' + n;
   }
 
+  // 结果里可能混着「已删除/文件已不在」的旧产物：默认必须选中第一个仍然有效的（存在且未删除），
+  // 否则旧产物会一直占住第一个标签，新转出来的结果被它挡住，界面看起来就像「没有结果」。
+  function liveResultIndex(list){
+    var i;
+    for (i = 0; i < (list || []).length; i++){
+      if (list[i].exists && !list[i].cleaned) return i;
+    }
+    return 0;
+  }
+
   function renderTabs(){
     var wrap = el('tabs'); wrap.innerHTML = '';
     var gg = g(); if (!gg) return;
     gg.results.forEach(function(res, i){
       var b = document.createElement('button');
-      b.className = 'tab' + (i === ci ? ' act' : '');
+      var dead = !res.exists || res.cleaned;
+      b.className = 'tab' + (i === ci ? ' act' : '') + (dead ? ' dead' : '');
       b.textContent = res.tag || ('结果' + (i+1));
-      b.title = res.name;
+      b.title = res.name + (dead ? '（已删除，文件不在磁盘）' : '');
       b.onclick = function(){ switchResult(i); };
       wrap.appendChild(b);
     });
@@ -347,7 +359,7 @@
   function go(d){
     var n = Q ? Q.groups.length : 0;
     if (gi + d < 0 || gi + d >= n){ say(d < 0 ? '已经是第一组' : '已经是最后一组'); return; }
-    gi += d; ci = 0; showGroup(true);
+    gi += d; ci = liveResultIndex(Q.groups[gi].results); showGroup(true);
   }
   function jumpUnreviewed(){
     var n = Q ? Q.groups.length : 0, i, k, gg;
@@ -356,7 +368,7 @@
       gg = Q.groups[i];
       var list = (gg.src ? [gg.src] : []).concat(gg.results);
       for (var j=0;j<list.length;j++){
-        if (!list[j].reviewed && !list[j].cleaned){ gi = i; ci = 0; showGroup(true); say('已跳到未审阅的项组'); return; }
+        if (!list[j].reviewed && !list[j].cleaned){ gi = i; ci = liveResultIndex(gg.results); showGroup(true); say('已跳到未审阅的项组'); return; }
       }
     }
     say('所有项都已看过');
